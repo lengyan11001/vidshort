@@ -1367,6 +1367,14 @@ button {
   padding: 0 18px 18px;
 }
 
+.upload-modal-body {
+  padding: 0 18px 18px;
+}
+
+.upload-modal-body form {
+  padding: 0;
+}
+
 .cms-modal .form-title {
   display: none;
 }

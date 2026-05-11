@@ -7,9 +7,10 @@ const cmsState = {
   transactions: [],
   comments: [],
   fandom: [],
-  section: "dashboard",
+  section: "dramas",
   editingDramaId: null,
   editingGuideId: null,
+  uploadOpen: false,
   dramaFilters: {
     q: "",
     status: "all",
@@ -53,9 +54,8 @@ function shell(content) {
       <aside class="cms-sidebar">
         <div class="cms-logo"><div class="logo">R</div><span>CMS</span></div>
         <nav class="cms-nav">
-          ${navButton("dashboard", "Dashboard", "gauge")}
           ${navButton("dramas", "Dramas", "film")}
-          ${navButton("upload", "Upload", "cloudUpload")}
+          ${navButton("dashboard", "Dashboard", "gauge")}
           ${navButton("guides", "Guides", "book")}
           ${navButton("comments", "Comments", "messages")}
           ${navButton("users", "Users", "users")}
@@ -138,7 +138,7 @@ function dramas() {
     return matchesQ && matchesStatus && matchesCategory;
   });
   return `
-    ${pageHeader("Dramas", `${rows.length} / ${cmsState.dramas.length} titles`, `<button class="cms-btn" data-section="upload">${icon("cloudUpload")}Upload ZIP</button>`)}
+    ${pageHeader("Dramas", `${rows.length} / ${cmsState.dramas.length} titles`, `<button class="cms-btn" data-open-upload>${icon("cloudUpload")}Upload ZIP</button>`)}
     <section class="cms-panel">
       <div class="cms-toolbar">
         <input class="cms-search" data-drama-filter="q" value="${filters.q}" placeholder="Search title or ID">
@@ -183,6 +183,7 @@ function dramas() {
       </div>
     </section>
     ${cmsState.editingDramaId ? dramaModal(dramaById(cmsState.editingDramaId)) : ""}
+    ${cmsState.uploadOpen ? uploadModal() : ""}
   `;
 }
 
@@ -252,43 +253,55 @@ function editForm(drama = {}) {
   `;
 }
 
-function upload() {
+function uploadForm() {
   return `
-    ${pageHeader("Upload", "Batch import episodes")}
-    <section class="cms-panel">
-      <form data-zip-upload-form>
-        <div class="form-grid">
-          ${field("title", "Title", "")}
-          ${selectField("category", "Category", "Romance", cmsState.settings.categories)}
-          ${field("freeEpisodes", "Free Episodes", cmsState.settings.monetization.freeEpisodesDefault || 6, "number")}
-          ${field("weight", "Weight", 1, "number")}
-          ${field("cover", "Cover URL", "")}
-          ${field("banner", "Banner URL", "")}
-          <div class="field"><label>Subscription</label><select name="subscriptionOnly"><option value="false">Off</option><option value="true">On</option></select></div>
-          <div class="field full"><label>Description</label><textarea name="description"></textarea></div>
-          <div class="field full">
-            <label>ZIP Package</label>
-            <input class="upload-file-input" id="zipPackage" name="file" type="file" accept=".zip" data-upload-file>
-            <label class="upload-picker" for="zipPackage" data-upload-drop>
-              <span class="upload-picker-icon">${icon("cloudUpload")}</span>
-              <span class="upload-picker-main">
-                <strong data-upload-file-name>Choose or drop ZIP</strong>
-                <small>01.mp4, episode-02.mp4, EP003.mov</small>
-              </span>
-              <span class="cms-btn-secondary upload-picker-action">Browse</span>
-            </label>
-          </div>
+    <form data-zip-upload-form>
+      <div class="form-grid">
+        ${field("title", "Title", "")}
+        ${selectField("category", "Category", "Romance", cmsState.settings.categories)}
+        ${field("freeEpisodes", "Free Episodes", cmsState.settings.monetization.freeEpisodesDefault || 6, "number")}
+        ${field("weight", "Weight", 1, "number")}
+        ${field("cover", "Cover URL", "")}
+        ${field("banner", "Banner URL", "")}
+        <div class="field"><label>Subscription</label><select name="subscriptionOnly"><option value="false">Off</option><option value="true">On</option></select></div>
+        <div class="field full"><label>Description</label><textarea name="description"></textarea></div>
+        <div class="field full">
+          <label>ZIP Package</label>
+          <input class="upload-file-input" id="zipPackage" name="file" type="file" accept=".zip" data-upload-file>
+          <label class="upload-picker" for="zipPackage" data-upload-drop>
+            <span class="upload-picker-icon">${icon("cloudUpload")}</span>
+            <span class="upload-picker-main">
+              <strong data-upload-file-name>Choose or drop ZIP</strong>
+              <small>01.mp4, episode-02.mp4, EP003.mov</small>
+            </span>
+            <span class="cms-btn-secondary upload-picker-action">Browse</span>
+          </label>
         </div>
-        <div class="upload-progress" data-upload-progress hidden>
-          <div class="upload-progress-bar" data-upload-progress-bar></div>
+      </div>
+      <div class="upload-progress" data-upload-progress hidden>
+        <div class="upload-progress-bar" data-upload-progress-bar></div>
+      </div>
+      <div class="upload-progress-meta" data-upload-progress-text></div>
+      <div class="cms-actions">
+        <button class="cms-btn-secondary" type="button" data-close-modal>Cancel</button>
+        <button class="cms-btn" type="submit" data-upload-submit>Upload</button>
+      </div>
+    </form>
+    <div id="uploadResult" class="upload-result"></div>
+  `;
+}
+
+function uploadModal() {
+  return `
+    <div class="cms-modal-backdrop" data-close-modal>
+      <section class="cms-modal" role="dialog" aria-modal="true" data-modal-panel>
+        <div class="cms-modal-head">
+          <div><h2>Upload ZIP</h2><p>Batch import episodes</p></div>
+          <button class="icon-action" data-close-modal title="Close">${icon("close")}</button>
         </div>
-        <div class="upload-progress-meta" data-upload-progress-text></div>
-        <div class="cms-actions">
-          <button class="cms-btn" type="submit" data-upload-submit>Upload</button>
-        </div>
-      </form>
-      <div id="uploadResult" class="upload-result"></div>
-    </section>
+        <div class="upload-modal-body">${uploadForm()}</div>
+      </section>
+    </div>
   `;
 }
 
@@ -478,7 +491,7 @@ function render() {
     cmsRoot.innerHTML = `<main class="cms-main"><p>Loading</p></main>`;
     return;
   }
-  const sections = { dashboard, dramas, upload, guides, comments, users, settings };
+  const sections = { dashboard, dramas, guides, comments, users, settings };
   cmsRoot.innerHTML = shell(`<section class="cms-section active">${(sections[cmsState.section] || dashboard)()}</section>`);
   bind();
 }
@@ -487,6 +500,13 @@ function bind() {
   cmsRoot.querySelectorAll("[data-section]").forEach((button) => {
     button.addEventListener("click", () => {
       cmsState.section = button.dataset.section;
+      cmsState.uploadOpen = false;
+      render();
+    });
+  });
+  cmsRoot.querySelectorAll("[data-open-upload]").forEach((button) => {
+    button.addEventListener("click", () => {
+      cmsState.uploadOpen = true;
       render();
     });
   });
@@ -507,6 +527,7 @@ function bind() {
       if (event.target.closest("[data-modal-panel]") && event.currentTarget.classList.contains("cms-modal-backdrop")) return;
       cmsState.editingDramaId = null;
       cmsState.editingGuideId = null;
+      cmsState.uploadOpen = false;
       render();
     });
   });
@@ -681,15 +702,15 @@ function bind() {
               <strong>${json.drama.title}</strong>
               <span>${json.matched.length} episodes imported</span>
             </div>
-            <button class="cms-btn-secondary" type="button" data-upload-view-dramas>View Dramas</button>
           </div>
         `;
         const data = await api("/api/cms");
         Object.assign(cmsState, data);
-        result.querySelector("[data-upload-view-dramas]").addEventListener("click", () => {
-          cmsState.section = "dramas";
+        cmsState.section = "dramas";
+        window.setTimeout(() => {
+          cmsState.uploadOpen = false;
           render();
-        });
+        }, 450);
       });
       xhr.addEventListener("error", () => {
         submit.disabled = false;
