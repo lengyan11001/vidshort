@@ -35,7 +35,8 @@ function initials(text) {
 }
 
 function isUnlocked(episode) {
-  return episode.isFree || state.user.unlockedEpisodes.includes(episode.id);
+  if (!episode) return false;
+  return Boolean(episode.isFree || state.user?.unlockedEpisodes?.includes(episode.id));
 }
 
 function dramaById(id) {
@@ -47,7 +48,8 @@ function currentDrama() {
 }
 
 function currentEpisode(drama) {
-  return (drama.episodes || []).find((item) => item.number === state.selectedEpisode) || (drama.episodes || [])[0];
+  const episodes = drama?.episodes || [];
+  return episodes.find((item) => item.number === state.selectedEpisode) || episodes[0] || null;
 }
 
 function navItem(view, label, iconName) {
@@ -220,8 +222,24 @@ function renderProfile() {
 function renderPlayer() {
   const drama = currentDrama();
   const episode = currentEpisode(drama);
+  if (!drama) return topShell(`<main class="content"><p class="muted">No dramas available</p></main>`);
   const episodes = drama.episodes || [];
-  const favorite = state.user.favorites.includes(drama.id);
+  const favorite = state.user?.favorites?.includes(drama.id);
+  if (!episode) {
+    return `
+      <main class="player-page content">
+        <div class="crumb">Home / ${drama.title}</div>
+        <section class="video-frame">
+          <div class="video-art" style="background-image:url('${drama.banner}')"></div>
+          <div class="video-caption">No episodes available</div>
+        </section>
+        <section class="episode-head">
+          <h1>${drama.title}</h1>
+          <button class="icon-btn" data-view="home">${icon("close")}</button>
+        </section>
+      </main>
+    `;
+  }
   const unlocked = isUnlocked(episode);
   return `
     <main class="player-page content">
@@ -343,7 +361,8 @@ function bind() {
   app.querySelectorAll("[data-episode]").forEach((button) => {
     button.addEventListener("click", () => {
       const drama = currentDrama();
-      const episode = drama.episodes.find((item) => item.number === Number(button.dataset.episode));
+      const episode = (drama?.episodes || []).find((item) => item.number === Number(button.dataset.episode));
+      if (!episode) return;
       if (!isUnlocked(episode)) {
         state.lockTarget = episode;
         openLockSheet(episode);
@@ -370,6 +389,7 @@ function bind() {
       if (!body) return;
       const drama = currentDrama();
       const episode = currentEpisode(drama);
+      if (!drama || !episode) return;
       await api("/api/comments", { method: "POST", body: { dramaId: drama.id, episodeId: episode.id, body } });
       form.reset();
       alert("Submitted");
@@ -434,7 +454,9 @@ function closeDrawer() {
 }
 
 function openLockSheet(episode) {
+  if (!episode) return;
   const drama = currentDrama();
+  if (!drama) return;
   const adUnitId = state.client?.rewardedAdUnitId || state.settings.monetization.rewardedAdUnitId;
   lockSheet.classList.add("open");
   lockSheet.innerHTML = `
