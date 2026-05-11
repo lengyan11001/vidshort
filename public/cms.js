@@ -245,7 +245,7 @@ function editForm(drama = {}) {
 
 function upload() {
   return `
-    ${pageHeader("Upload", "Create drama, batch episodes and prepare media metadata")}
+    ${pageHeader("Upload", "Batch import episodes")}
     <section class="cms-panel">
       <form data-zip-upload-form>
         <div class="form-grid">
@@ -258,21 +258,26 @@ function upload() {
           <div class="field full"><label>Description</label><textarea name="description"></textarea></div>
           <div class="field full">
             <label>ZIP Package</label>
-            <input name="file" type="file" accept=".zip">
+            <input class="upload-file-input" id="zipPackage" name="file" type="file" accept=".zip" data-upload-file>
+            <label class="upload-picker" for="zipPackage" data-upload-drop>
+              <span class="upload-picker-icon">${icon("cloudUpload")}</span>
+              <span class="upload-picker-main">
+                <strong data-upload-file-name>Choose or drop ZIP</strong>
+                <small>01.mp4, episode-02.mp4, EP003.mov</small>
+              </span>
+              <span class="cms-btn-secondary upload-picker-action">Browse</span>
+            </label>
           </div>
         </div>
-        <div class="upload-drop" style="margin-top:14px">
-          <div>
-            <div style="margin-bottom:10px">${icon("upload")}</div>
-            <strong>Episode files are matched by number in filename</strong>
-            <p>Examples: 01.mp4, episode-02.mp4, EP003.mov</p>
-          </div>
+        <div class="upload-progress" data-upload-progress hidden>
+          <div class="upload-progress-bar" data-upload-progress-bar></div>
         </div>
+        <div class="upload-progress-meta" data-upload-progress-text></div>
         <div class="cms-actions">
-          <button class="cms-btn" type="submit">Upload ZIP</button>
+          <button class="cms-btn" type="submit" data-upload-submit>Upload</button>
         </div>
       </form>
-      <div id="uploadResult" style="margin-top:14px"></div>
+      <div id="uploadResult" class="upload-result"></div>
     </section>
   `;
 }
@@ -476,36 +481,101 @@ function bind() {
       await load();
     });
   });
+  cmsRoot.querySelectorAll("[data-upload-file]").forEach((input) => {
+    const form = input.closest("[data-zip-upload-form]");
+    const drop = form?.querySelector("[data-upload-drop]");
+    const name = form?.querySelector("[data-upload-file-name]");
+    const setFileName = () => {
+      name.textContent = input.files?.[0]?.name || "Choose or drop ZIP";
+    };
+    input.addEventListener("change", setFileName);
+    if (!drop) return;
+    ["dragenter", "dragover"].forEach((type) => {
+      drop.addEventListener(type, (event) => {
+        event.preventDefault();
+        drop.classList.add("dragging");
+      });
+    });
+    ["dragleave", "drop"].forEach((type) => {
+      drop.addEventListener(type, (event) => {
+        event.preventDefault();
+        drop.classList.remove("dragging");
+      });
+    });
+    drop.addEventListener("drop", (event) => {
+      if (!event.dataTransfer?.files?.length) return;
+      const transfer = new DataTransfer();
+      transfer.items.add(event.dataTransfer.files[0]);
+      input.files = transfer.files;
+      setFileName();
+    });
+  });
   cmsRoot.querySelectorAll("[data-zip-upload-form]").forEach((form) => {
-    form.addEventListener("submit", async (event) => {
+    form.addEventListener("submit", (event) => {
       event.preventDefault();
       const result = cmsRoot.querySelector("#uploadResult");
+      const progress = form.querySelector("[data-upload-progress]");
+      const progressBar = form.querySelector("[data-upload-progress-bar]");
+      const progressText = form.querySelector("[data-upload-progress-text]");
+      const submit = form.querySelector("[data-upload-submit]");
       const formData = new FormData(form);
       if (!formData.get("file") || !formData.get("file").name) {
-        result.innerHTML = `<span class="cms-pill hidden">Choose a ZIP file</span>`;
+        result.innerHTML = `<div class="upload-message error">Choose a ZIP file</div>`;
         return;
       }
-      result.innerHTML = `<span class="cms-pill pending">Uploading</span>`;
-      const response = await fetch("/api/dramas/upload-zip", { method: "POST", body: formData });
-      const json = await response.json();
-      if (!response.ok) {
-        result.innerHTML = `<span class="cms-pill hidden">${json.error || "Upload failed"}</span>`;
-        return;
-      }
-      result.innerHTML = `
-        <div class="cms-panel" style="box-shadow:none">
-          <div class="cms-panel-head"><h2>${json.drama.title}</h2><span class="cms-pill published">${json.matched.length} episodes</span></div>
-          <div class="table-wrap">
-            <table class="data-table">
-              <thead><tr><th>Episode</th><th>Original File</th><th>URL</th></tr></thead>
-              <tbody>${json.matched.map((item) => `<tr><td>${item.number}</td><td>${item.originalFilename}</td><td>${item.videoUrl}</td></tr>`).join("")}</tbody>
-            </table>
+      submit.disabled = true;
+      progress.hidden = false;
+      progressBar.style.width = "0%";
+      progressText.textContent = "Uploading 0%";
+      result.innerHTML = "";
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/dramas/upload-zip");
+      xhr.upload.addEventListener("progress", (uploadEvent) => {
+        if (!uploadEvent.lengthComputable) {
+          progressText.textContent = "Uploading";
+          return;
+        }
+        const percent = Math.max(1, Math.round((uploadEvent.loaded / uploadEvent.total) * 100));
+        progressBar.style.width = `${percent}%`;
+        progressText.textContent = percent >= 100 ? "Processing" : `Uploading ${percent}%`;
+      });
+      xhr.addEventListener("load", async () => {
+        let json = {};
+        try {
+          json = JSON.parse(xhr.responseText || "{}");
+        } catch (error) {
+          json = { error: "Upload failed" };
+        }
+        submit.disabled = false;
+        if (xhr.status < 200 || xhr.status >= 300) {
+          progressText.textContent = "";
+          result.innerHTML = `<div class="upload-message error">${json.error || "Upload failed"}</div>`;
+          return;
+        }
+        progressBar.style.width = "100%";
+        progressText.textContent = "Complete";
+        result.innerHTML = `
+          <div class="upload-summary">
+            <div>
+              <strong>${json.drama.title}</strong>
+              <span>${json.matched.length} episodes imported</span>
+            </div>
+            <button class="cms-btn-secondary" type="button" data-upload-view-dramas>View Dramas</button>
           </div>
-        </div>
-      `;
-      await load();
-      cmsState.section = "dramas";
-      render();
+        `;
+        const data = await api("/api/cms");
+        Object.assign(cmsState, data);
+        result.querySelector("[data-upload-view-dramas]").addEventListener("click", () => {
+          cmsState.section = "dramas";
+          render();
+        });
+      });
+      xhr.addEventListener("error", () => {
+        submit.disabled = false;
+        progressText.textContent = "";
+        result.innerHTML = `<div class="upload-message error">Network error</div>`;
+      });
+      xhr.send(formData);
     });
   });
   cmsRoot.querySelectorAll("[data-comment-status]").forEach((button) => {

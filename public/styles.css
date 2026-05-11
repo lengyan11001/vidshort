@@ -1156,15 +1156,140 @@ button {
   background: linear-gradient(90deg, #ff6b1a, #f6b23d);
 }
 
-.upload-drop {
+.upload-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.upload-picker {
   display: grid;
-  place-items: center;
-  min-height: 160px;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 70px;
+  padding: 12px;
   border: 1px dashed #c8ced8;
   border-radius: 8px;
-  color: #687080;
+  color: #273142;
   background: #fbfcfd;
-  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+}
+
+.upload-picker:hover,
+.upload-picker.dragging {
+  border-color: #ff6b1a;
+  background: #fff8f3;
+  box-shadow: 0 0 0 3px rgba(255, 107, 26, 0.1);
+}
+
+.upload-picker-icon {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 8px;
+  color: #ff6b1a;
+  background: #fff1e8;
+}
+
+.upload-picker-icon svg {
+  width: 22px;
+  height: 22px;
+  stroke-width: 2.4;
+}
+
+.upload-picker-main {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.upload-picker-main strong,
+.upload-picker-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-picker-main small {
+  color: #687080;
+}
+
+.upload-picker-action {
+  pointer-events: none;
+}
+
+.upload-progress {
+  position: relative;
+  height: 8px;
+  margin-top: 14px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #edf0f3;
+}
+
+.upload-progress-bar {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #ff6b1a, #f6b23d);
+  transition: width 0.18s ease;
+}
+
+.upload-progress-meta {
+  min-height: 22px;
+  margin-top: 8px;
+  color: #687080;
+  font-size: 13px;
+}
+
+.upload-result {
+  margin-top: 14px;
+}
+
+.upload-message,
+.upload-summary {
+  border: 1px solid #edf0f3;
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.upload-message {
+  padding: 12px;
+  color: #273142;
+}
+
+.upload-message.error {
+  border-color: #ffd3d7;
+  color: #b42335;
+  background: #fff5f6;
+}
+
+.upload-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+}
+
+.upload-summary strong,
+.upload-summary span {
+  display: block;
+}
+
+.upload-summary span {
+  margin-top: 3px;
+  color: #687080;
+}
+
+.cms-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .cms-modal-backdrop {

@@ -416,7 +416,24 @@ function publicMediaUrl(dramaId, filename) {
 
 function extractZip(zipPath, destDir) {
   fs.mkdirSync(destDir, { recursive: true });
-  childProcess.execFileSync("unzip", ["-q", "-o", zipPath, "-d", destDir], { stdio: "pipe" });
+  if (process.platform === "win32") {
+    const quotePsPath = (value) => `'${String(value).replace(/'/g, "''")}'`;
+    childProcess.execFileSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-Command",
+        `Expand-Archive -LiteralPath ${quotePsPath(zipPath)} -DestinationPath ${quotePsPath(destDir)} -Force`
+      ],
+      { stdio: "pipe" }
+    );
+    return;
+  }
+  try {
+    childProcess.execFileSync("unzip", ["-q", "-o", zipPath, "-d", destDir], { stdio: "pipe" });
+  } catch (error) {
+    throw new Error("ZIP extraction failed. Install unzip on the server or upload a valid ZIP file.");
+  }
 }
 
 function publicMetrics(db) {
