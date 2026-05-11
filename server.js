@@ -46,8 +46,8 @@ const DEFAULT_SETTINGS = {
   regions: ["US"],
   currencyName: "Beans",
   policyUrls: {
-    privacy: "http://localhost:4173/privacy",
-    terms: "http://localhost:4173/terms"
+    privacy: "https://vidshort.uk/privacy",
+    terms: "https://vidshort.uk/terms"
   },
   tiktok: {
     appId: "replace_with_tiktok_mini_app_id",

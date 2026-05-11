@@ -2,8 +2,8 @@
   "appid": "replace_with_tiktok_mini_app_id",
   "projectName": "Drama Mini Suite",
   "clientKey": "replace_with_client_key",
-  "privacyPolicyUrl": "http://localhost:4173/privacy",
-  "termsOfServiceUrl": "http://localhost:4173/terms",
+  "privacyPolicyUrl": "https://vidshort.uk/privacy",
+  "termsOfServiceUrl": "https://vidshort.uk/terms",
   "dev": {
     "command": "node server.js",
     "port": 4173,
@@ -19,14 +19,18 @@
   },
   "domains": {
     "request": [
-      "https://api.example.com",
+      "https://api.vidshort.uk",
+      "https://vidshort.uk",
+      "https://cms.vidshort.uk",
       "http://localhost:4173"
     ],
     "upload": [
-      "https://api.example.com"
+      "https://api.vidshort.uk",
+      "https://cdn.vidshort.uk"
     ],
     "download": [
-      "https://cdn.example.com"
+      "https://cdn.vidshort.uk",
+      "https://vidshort.uk"
     ]
   }
 }
