@@ -70,9 +70,13 @@ Main frontend:
 ```bash
 wrangler r2 object put vidshort-web/index.html --remote --file public/index.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
 wrangler r2 object put vidshort-web/styles.css --remote --file public/styles.css --content-type 'text/css; charset=utf-8' --cache-control 'public, max-age=300'
+wrangler r2 object put vidshort-web/styles.v20260511-2.css --remote --file public/styles.v20260511-2.css --content-type 'text/css; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 wrangler r2 object put vidshort-web/app.js --remote --file public/app.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=300'
+wrangler r2 object put vidshort-web/app.v20260511-2.js --remote --file public/app.v20260511-2.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 wrangler r2 object put vidshort-web/icons.js --remote --file public/icons.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=300'
+wrangler r2 object put vidshort-web/icons.v20260511-2.js --remote --file public/icons.v20260511-2.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 wrangler r2 object put vidshort-web/ttminis-adapter.js --remote --file public/ttminis-adapter.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=300'
+wrangler r2 object put vidshort-web/ttminis-adapter.v20260511-2.js --remote --file public/ttminis-adapter.v20260511-2.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 wrangler r2 object put vidshort-web/privacy.html --remote --file public/privacy.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
 wrangler r2 object put vidshort-web/terms.html --remote --file public/terms.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
 wrangler r2 object put vidshort-web/cms.html --remote --file public/cms.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
@@ -83,8 +87,11 @@ CMS frontend:
 ```bash
 wrangler r2 object put vidshort-cms/index.html --remote --file public/cms.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
 wrangler r2 object put vidshort-cms/styles.css --remote --file public/styles.css --content-type 'text/css; charset=utf-8' --cache-control 'public, max-age=300'
+wrangler r2 object put vidshort-cms/styles.v20260511-2.css --remote --file public/styles.v20260511-2.css --content-type 'text/css; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 wrangler r2 object put vidshort-cms/cms.js --remote --file public/cms.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=300'
+wrangler r2 object put vidshort-cms/cms.v20260511-2.js --remote --file public/cms.v20260511-2.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 wrangler r2 object put vidshort-cms/icons.js --remote --file public/icons.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=300'
+wrangler r2 object put vidshort-cms/icons.v20260511-2.js --remote --file public/icons.v20260511-2.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 ```
 
 CDN files:
@@ -160,5 +167,5 @@ DNS and edge certificates can take a few minutes to settle after custom domain c
 ## Operational notes
 
 - The backend still runs on the server at `101.47.12.37`.
-- The current Node backend still stores CMS uploads under local `media/`; moving uploaded videos/images automatically into `vidshort-cdn` requires a backend upload change.
+- The Node backend reads `/opt/vidshort/app/.env` and uploads CMS ZIP episode videos to `vidshort-cdn` when R2 S3 credentials are present.
 - Use `https://cdn.vidshort.uk/<object-key>` for public video/image URLs after files are uploaded to `vidshort-cdn`.

@@ -4,6 +4,27 @@ const path = require("path");
 const crypto = require("crypto");
 const childProcess = require("child_process");
 
+function loadDotEnv(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    const key = match[1];
+    let value = match[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      const quote = value[0];
+      value = value.slice(1, -1);
+      if (quote === '"') value = value.replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    }
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+
+loadDotEnv(path.join(__dirname, ".env"));
+
 const PORT = Number(process.env.PORT || 4173);
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
@@ -37,6 +58,26 @@ function staticCacheControl(filePath) {
   return "public, max-age=3600";
 }
 
+function withoutTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/, "");
+}
+
+function runtimeR2Config() {
+  return {
+    endpoint: withoutTrailingSlash(process.env.R2_ENDPOINT || ""),
+    accessKeyId: process.env.R2_ACCESS_KEY_ID || "",
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || "",
+    region: process.env.R2_REGION || process.env.AWS_DEFAULT_REGION || "auto",
+    bucket: process.env.VIDSHORT_CDN_BUCKET || "vidshort-cdn",
+    publicBaseUrl: withoutTrailingSlash(process.env.VIDSHORT_CDN_DOMAIN || "https://cdn.vidshort.uk")
+  };
+}
+
+function isR2Configured() {
+  const config = runtimeR2Config();
+  return Boolean(config.endpoint && config.accessKeyId && config.secretAccessKey && config.bucket && config.publicBaseUrl);
+}
+
 const DEFAULT_SETTINGS = {
   brand: "ReelPilot",
   defaultLanguage: "English",
@@ -65,8 +106,9 @@ const DEFAULT_SETTINGS = {
     dailyAdUnlockLimit: 8
   },
   media: {
-    storage: "local",
-    mediaBaseUrl: "/media",
+    storage: isR2Configured() ? "r2" : "local",
+    mediaBaseUrl: isR2Configured() ? runtimeR2Config().publicBaseUrl : "/media",
+    cdnBucket: process.env.VIDSHORT_CDN_BUCKET || "",
     maxUploadMb: 2048,
     allowedVideoExtensions: [".mp4", ".m4v", ".mov", ".webm"]
   }
@@ -131,6 +173,18 @@ function normalizeDb(db) {
   if (db.settings.monetization?.subscriptionsEnabled !== true) {
     db.settings.monetization.subscriptionsEnabled = true;
     changed = true;
+  }
+  if (isR2Configured()) {
+    const r2Config = runtimeR2Config();
+    if (db.settings.media?.storage !== "r2" || db.settings.media?.mediaBaseUrl !== r2Config.publicBaseUrl || db.settings.media?.cdnBucket !== r2Config.bucket) {
+      db.settings.media = {
+        ...(db.settings.media || {}),
+        storage: "r2",
+        mediaBaseUrl: r2Config.publicBaseUrl,
+        cdnBucket: r2Config.bucket
+      };
+      changed = true;
+    }
   }
 
   db.users = db.users || [];
@@ -507,6 +561,83 @@ function publicMediaUrl(dramaId, filename) {
   return `/media/dramas/${dramaId}/${encodeURIComponent(filename).replace(/%2F/g, "/")}`;
 }
 
+function encodeObjectKey(key) {
+  return String(key)
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+}
+
+function hmac(key, value, encoding) {
+  return crypto.createHmac("sha256", key).update(value, "utf8").digest(encoding);
+}
+
+function sha256(value, encoding = "hex") {
+  return crypto.createHash("sha256").update(value).digest(encoding);
+}
+
+function signingKey(secret, dateStamp, region) {
+  const kDate = hmac(`AWS4${secret}`, dateStamp);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, "s3");
+  return hmac(kService, "aws4_request");
+}
+
+async function putR2Object(objectKey, filePath, contentType) {
+  const config = runtimeR2Config();
+  if (!isR2Configured()) throw new Error("R2 storage is not configured");
+
+  const body = fs.readFileSync(filePath);
+  const payloadHash = sha256(body);
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const dateStamp = amzDate.slice(0, 8);
+  const host = new URL(config.endpoint).host;
+  const encodedKey = encodeObjectKey(objectKey);
+  const canonicalUri = `/${config.bucket}/${encodedKey}`;
+  const canonicalHeaders = [
+    `host:${host}`,
+    `x-amz-content-sha256:${payloadHash}`,
+    `x-amz-date:${amzDate}`
+  ].join("\n") + "\n";
+  const signedHeaders = "host;x-amz-content-sha256;x-amz-date";
+  const canonicalRequest = ["PUT", canonicalUri, "", canonicalHeaders, signedHeaders, payloadHash].join("\n");
+  const credentialScope = `${dateStamp}/${config.region}/s3/aws4_request`;
+  const stringToSign = ["AWS4-HMAC-SHA256", amzDate, credentialScope, sha256(canonicalRequest)].join("\n");
+  const signature = hmac(signingKey(config.secretAccessKey, dateStamp, config.region), stringToSign, "hex");
+  const response = await fetch(`${config.endpoint}${canonicalUri}`, {
+    method: "PUT",
+    headers: {
+      Authorization: `AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+      "Content-Type": contentType,
+      "Content-Length": String(body.length),
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "x-amz-content-sha256": payloadHash,
+      "x-amz-date": amzDate
+    },
+    body
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`R2 upload failed: ${response.status} ${text.slice(0, 180)}`.trim());
+  }
+  return `${config.publicBaseUrl}/${encodeObjectKey(objectKey)}`;
+}
+
+async function storeEpisodeVideo(dramaId, number, sourcePath, filename) {
+  const ext = path.extname(filename).toLowerCase();
+  const contentType = mimeTypes[ext] || "application/octet-stream";
+  if (isR2Configured()) {
+    const objectKey = `dramas/${dramaId}/${filename}`;
+    const videoUrl = await putR2Object(objectKey, sourcePath, contentType);
+    return { videoUrl, storage: "r2", objectKey, bucket: runtimeR2Config().bucket };
+  }
+  const publicRoot = path.join(MEDIA_DIR, "dramas", dramaId);
+  fs.mkdirSync(publicRoot, { recursive: true });
+  fs.copyFileSync(sourcePath, path.join(publicRoot, filename));
+  return { videoUrl: publicMediaUrl(dramaId, filename), storage: "local", objectKey: `media/dramas/${dramaId}/${filename}`, bucket: "" };
+}
+
 function extractZip(zipPath, destDir) {
   fs.mkdirSync(destDir, { recursive: true });
   if (process.platform === "win32") {
@@ -740,11 +871,8 @@ async function handleApi(req, res, url) {
     const category = String(parts.category || "Romance");
     const uploadRoot = path.join(MEDIA_DIR, "uploads", id);
     const extractRoot = path.join(uploadRoot, "extract");
-    const publicRoot = path.join(MEDIA_DIR, "dramas", id);
     fs.rmSync(uploadRoot, { recursive: true, force: true });
     fs.mkdirSync(uploadRoot, { recursive: true });
-    fs.rmSync(publicRoot, { recursive: true, force: true });
-    fs.mkdirSync(publicRoot, { recursive: true });
 
     const zipPath = path.join(uploadRoot, safeName(file.filename));
     try {
@@ -752,7 +880,6 @@ async function handleApi(req, res, url) {
       extractZip(zipPath, extractRoot);
     } catch (error) {
       fs.rmSync(uploadRoot, { recursive: true, force: true });
-      fs.rmSync(publicRoot, { recursive: true, force: true });
       return sendJson(res, { error: error.message || "ZIP extraction failed" }, 400);
     }
 
@@ -772,7 +899,6 @@ async function handleApi(req, res, url) {
     walk(extractRoot);
     if (!discovered.length) {
       fs.rmSync(uploadRoot, { recursive: true, force: true });
-      fs.rmSync(publicRoot, { recursive: true, force: true });
       return sendJson(res, { error: "No video files found in ZIP" }, 400);
     }
 
@@ -781,29 +907,38 @@ async function handleApi(req, res, url) {
       .sort((a, b) => a.number - b.number || a.full.localeCompare(b.full));
 
     const used = new Set();
-    const episodes = numbered.map((item, index) => {
-      let number = item.number || index + 1;
-      while (used.has(number)) number += 1;
-      used.add(number);
-      const ext = path.extname(item.full).toLowerCase();
-      const filename = `episode-${String(number).padStart(3, "0")}${ext}`;
-      fs.copyFileSync(item.full, path.join(publicRoot, filename));
-      return {
-        id: `${id}_ep_${number}`,
-        dramaId: id,
-        number,
-        title: `Episode ${number}`,
-        duration: "",
-        price: number <= freeEpisodes ? 0 : 0,
-        isFree: number <= freeEpisodes,
-        resolution: "",
-        status: "ready",
-        originalFilename: path.basename(item.full),
-        videoUrl: publicMediaUrl(id, filename),
-        subtitleLanguages: [db.settings.defaultLanguage],
-        plot: ""
-      };
-    });
+    const episodes = [];
+    try {
+      for (const [index, item] of numbered.entries()) {
+        let number = item.number || index + 1;
+        while (used.has(number)) number += 1;
+        used.add(number);
+        const ext = path.extname(item.full).toLowerCase();
+        const filename = `episode-${String(number).padStart(3, "0")}${ext}`;
+        const stored = await storeEpisodeVideo(id, number, item.full, filename);
+        episodes.push({
+          id: `${id}_ep_${number}`,
+          dramaId: id,
+          number,
+          title: `Episode ${number}`,
+          duration: "",
+          price: number <= freeEpisodes ? 0 : 0,
+          isFree: number <= freeEpisodes,
+          resolution: "",
+          status: "ready",
+          originalFilename: path.basename(item.full),
+          videoUrl: stored.videoUrl,
+          storage: stored.storage,
+          objectKey: stored.objectKey,
+          bucket: stored.bucket,
+          subtitleLanguages: [db.settings.defaultLanguage],
+          plot: ""
+        });
+      }
+    } catch (error) {
+      fs.rmSync(uploadRoot, { recursive: true, force: true });
+      return sendJson(res, { error: error.message || "Video upload failed" }, 500);
+    }
 
     const drama = {
       id,
