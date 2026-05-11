@@ -105,6 +105,7 @@ const DEFAULT_SETTINGS = {
     freeEpisodesDefault: 6,
     dailyAdUnlockLimit: 8
   },
+  homeCarouselIds: ["drama_mer", "drama_blade", "drama_boss"],
   media: {
     storage: isR2Configured() ? "r2" : "local",
     mediaBaseUrl: isR2Configured() ? runtimeR2Config().publicBaseUrl : "/media",
@@ -162,6 +163,10 @@ function normalizeDb(db) {
     db.settings.supportedLanguages = [...DEFAULT_SETTINGS.supportedLanguages];
     changed = true;
   }
+  if (!Array.isArray(db.settings.homeCarouselIds)) {
+    db.settings.homeCarouselIds = [...DEFAULT_SETTINGS.homeCarouselIds];
+    changed = true;
+  }
   if (db.settings.monetization?.paymentsEnabled !== false) {
     db.settings.monetization.paymentsEnabled = false;
     changed = true;
@@ -206,6 +211,7 @@ function normalizeDb(db) {
   });
 
   db.dramas = db.dramas || [];
+  db.episodes = db.episodes || [];
   db.dramas.forEach((drama) => {
     drama.language = "English";
     drama.region = "US";
@@ -232,6 +238,7 @@ function normalizeDb(db) {
       changed = true;
     }
   });
+  if (normalizeUploadedEpisodeNumbers(db)) changed = true;
   db.fandom = db.fandom || [];
   db.fandom.forEach((post) => {
     if (!Number.isFinite(Number(post.weight))) {
@@ -445,12 +452,12 @@ function cmsHtmlWithApiAssets() {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ReelPilot CMS</title>
-    <link rel="stylesheet" href="/api/assets/styles.v20260511-6.css">
+    <link rel="stylesheet" href="/api/assets/styles.v20260511-7.css">
   </head>
   <body class="cms-body">
     <div id="cms"></div>
-    <script src="/api/assets/icons.v20260511-6.js"></script>
-    <script src="/api/assets/cms.v20260511-6.js"></script>
+    <script src="/api/assets/icons.v20260511-7.js"></script>
+    <script src="/api/assets/cms.v20260511-7.js"></script>
   </body>
 </html>`;
 }
@@ -553,16 +560,71 @@ function sortFandom(posts) {
 }
 
 function episodeNumberFromName(filename, fallback) {
-  const base = path.basename(filename, path.extname(filename));
-  const patterns = [
-    /(?:ep|episode|e|第)\s*0*(\d{1,5})(?:\s*集)?/i,
-    /(^|[^0-9])0*(\d{1,5})([^0-9]|$)/
-  ];
-  for (const pattern of patterns) {
-    const match = base.match(pattern);
-    if (match) return Number(match[2] || match[1]);
-  }
+  const base = path.basename(filename, path.extname(filename)).normalize("NFKC");
+  const explicit = base.match(/(?:^|[^a-z0-9])(?:ep|episode|e)\s*0*(\d{1,5})(?=$|[^0-9])/i);
+  if (explicit) return Number(explicit[1]);
+  const cn = base.match(/\u7b2c\s*0*(\d{1,5})\s*\u96c6/);
+  if (cn) return Number(cn[1]);
+  const numbers = [...base.matchAll(/\d{1,5}/g)].map((match) => Number(match[0]));
+  if (numbers.length) return numbers[numbers.length - 1];
   return fallback;
+}
+
+function rewriteEpisodeReferences(db, oldId, newId) {
+  if (oldId === newId) return;
+  db.users.forEach((user) => {
+    user.unlockedEpisodes = (user.unlockedEpisodes || []).map((id) => (id === oldId ? newId : id));
+    (user.watchHistory || []).forEach((item) => {
+      if (item.episodeId === oldId) item.episodeId = newId;
+    });
+  });
+  db.transactions.forEach((txn) => {
+    if (txn.episodeId === oldId) txn.episodeId = newId;
+  });
+  db.comments.forEach((comment) => {
+    if (comment.episodeId === oldId) comment.episodeId = newId;
+  });
+}
+
+function normalizeUploadedEpisodeNumbers(db) {
+  let changed = false;
+  for (const drama of db.dramas) {
+    const uploaded = db.episodes.filter((episode) => episode.dramaId === drama.id && episode.originalFilename);
+    if (!uploaded.length) continue;
+    const untouchedNumbers = new Set(
+      db.episodes.filter((episode) => episode.dramaId === drama.id && !episode.originalFilename).map((episode) => Number(episode.number))
+    );
+    const nextNumbers = new Map();
+    let canRewrite = true;
+    uploaded.forEach((episode) => {
+      const nextNumber = episodeNumberFromName(episode.originalFilename, Number(episode.number));
+      if (!Number.isFinite(nextNumber) || nextNumber < 1 || nextNumbers.has(nextNumber) || untouchedNumbers.has(nextNumber)) canRewrite = false;
+      nextNumbers.set(episode, nextNumber);
+    });
+    if (!canRewrite) continue;
+    for (const [episode, nextNumber] of nextNumbers.entries()) {
+      if (Number(episode.number) === nextNumber) continue;
+      const oldId = episode.id;
+      episode.number = nextNumber;
+      episode.id = `${drama.id}_ep_${nextNumber}`;
+      if (!episode.title || /^Episode \d+$/i.test(episode.title)) episode.title = `Episode ${nextNumber}`;
+      episode.isFree = nextNumber <= Number(drama.freeEpisodes || 0);
+      episode.price = episode.isFree ? 0 : Number(drama.unlockPrice || 0);
+      rewriteEpisodeReferences(db, oldId, episode.id);
+      changed = true;
+    }
+    const byName = new Map(uploaded.map((episode) => [episode.originalFilename, episode]));
+    (drama.upload?.matchedEpisodes || []).forEach((item) => {
+      const episode = byName.get(item.originalFilename);
+      if (!episode) return;
+      if (item.number !== episode.number) {
+        item.number = episode.number;
+        changed = true;
+      }
+      if (item.videoUrl !== episode.videoUrl) item.videoUrl = episode.videoUrl;
+    });
+  }
+  return changed;
 }
 
 function publicMediaUrl(dramaId, filename) {
@@ -1142,7 +1204,7 @@ async function handleApi(req, res, url) {
       userId: body.userId || "user_demo",
       userName: body.userName || "Avery",
       body: String(body.body || "").slice(0, 500),
-      status: "pending",
+      status: "visible",
       likes: 0,
       createdAt: new Date().toISOString()
     };
@@ -1169,7 +1231,8 @@ async function handleApi(req, res, url) {
       ...body,
       tiktok: { ...db.settings.tiktok, ...(body.tiktok || {}) },
       monetization: { ...db.settings.monetization, ...(body.monetization || {}) },
-      policyUrls: { ...db.settings.policyUrls, ...(body.policyUrls || {}) }
+      policyUrls: { ...db.settings.policyUrls, ...(body.policyUrls || {}) },
+      homeCarouselIds: Array.isArray(body.homeCarouselIds) ? body.homeCarouselIds : db.settings.homeCarouselIds
     };
     db.settings.defaultLanguage = "English";
     db.settings.launchRegion = "US";
