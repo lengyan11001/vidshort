@@ -442,7 +442,7 @@ function cmsHtmlWithApiAssets() {
   <body class="cms-body">
     <div id="cms"></div>
     <script src="/api/assets/icons.v20260511-2.js"></script>
-    <script src="/api/assets/cms.v20260511-2.js"></script>
+    <script src="/api/assets/cms.v20260511-3.js"></script>
   </body>
 </html>`;
 }
@@ -638,8 +638,36 @@ async function storeEpisodeVideo(dramaId, number, sourcePath, filename) {
   return { videoUrl: publicMediaUrl(dramaId, filename), storage: "local", objectKey: `media/dramas/${dramaId}/${filename}`, bucket: "" };
 }
 
-function extractZip(zipPath, destDir) {
+function extractArchive(archivePath, destDir) {
   fs.mkdirSync(destDir, { recursive: true });
+  const ext = path.extname(archivePath).toLowerCase();
+  if (![".zip", ".rar"].includes(ext)) {
+    throw new Error("Only .zip and .rar packages are supported.");
+  }
+  if (ext === ".rar") {
+    const attempts =
+      process.platform === "win32"
+        ? [
+            ["tar.exe", ["-xf", archivePath, "-C", destDir]],
+            ["7z.exe", ["x", "-y", `-o${destDir}`, archivePath]],
+            ["7za.exe", ["x", "-y", `-o${destDir}`, archivePath]]
+          ]
+        : [
+            ["unar", ["-quiet", "-force-overwrite", "-output-directory", destDir, archivePath]],
+            ["7z", ["x", "-y", `-o${destDir}`, archivePath]],
+            ["7za", ["x", "-y", `-o${destDir}`, archivePath]],
+            ["unrar", ["x", "-o+", "-idq", archivePath, destDir]]
+          ];
+    for (const [command, args] of attempts) {
+      try {
+        childProcess.execFileSync(command, args, { stdio: "pipe" });
+        return;
+      } catch (error) {
+        // Try the next available extractor.
+      }
+    }
+    throw new Error("RAR extraction failed. Install unar, 7z or unrar on the server, or upload a valid RAR file.");
+  }
   if (process.platform === "win32") {
     const quotePsPath = (value) => `'${String(value).replace(/'/g, "''")}'`;
     childProcess.execFileSync(
@@ -647,17 +675,17 @@ function extractZip(zipPath, destDir) {
       [
         "-NoProfile",
         "-Command",
-        `Expand-Archive -LiteralPath ${quotePsPath(zipPath)} -DestinationPath ${quotePsPath(destDir)} -Force`
+        `Expand-Archive -LiteralPath ${quotePsPath(archivePath)} -DestinationPath ${quotePsPath(destDir)} -Force`
       ],
       { stdio: "pipe" }
     );
     return;
   }
   try {
-    childProcess.execFileSync("unzip", ["-q", "-o", zipPath, "-d", destDir], { stdio: "pipe" });
+    childProcess.execFileSync("unzip", ["-q", "-o", archivePath, "-d", destDir], { stdio: "pipe" });
   } catch (error) {
     try {
-      childProcess.execFileSync("python3", ["-m", "zipfile", "-e", zipPath, destDir], { stdio: "pipe" });
+      childProcess.execFileSync("python3", ["-m", "zipfile", "-e", archivePath, destDir], { stdio: "pipe" });
     } catch (pythonError) {
       throw new Error("ZIP extraction failed. Upload a valid ZIP file.");
     }
@@ -862,8 +890,9 @@ async function handleApi(req, res, url) {
     const raw = await readRawBody(req, (db.settings.media?.maxUploadMb || 2048) * 1024 * 1024);
     const parts = parseMultipart(req, raw);
     const file = parts.file;
-    if (!file || !file.data?.length) return sendJson(res, { error: "ZIP file is required" }, 400);
-    if (!file.filename.toLowerCase().endsWith(".zip")) return sendJson(res, { error: "Only .zip is supported" }, 400);
+    if (!file || !file.data?.length) return sendJson(res, { error: "Archive file is required" }, 400);
+    const archiveExt = path.extname(file.filename).toLowerCase();
+    if (![".zip", ".rar"].includes(archiveExt)) return sendJson(res, { error: "Only .zip and .rar are supported" }, 400);
 
     const id = uid("drama");
     const title = String(parts.title || path.basename(file.filename, path.extname(file.filename)) || "Untitled Drama").trim();
@@ -874,13 +903,13 @@ async function handleApi(req, res, url) {
     fs.rmSync(uploadRoot, { recursive: true, force: true });
     fs.mkdirSync(uploadRoot, { recursive: true });
 
-    const zipPath = path.join(uploadRoot, safeName(file.filename));
+    const archivePath = path.join(uploadRoot, safeName(file.filename));
     try {
-      fs.writeFileSync(zipPath, file.data);
-      extractZip(zipPath, extractRoot);
+      fs.writeFileSync(archivePath, file.data);
+      extractArchive(archivePath, extractRoot);
     } catch (error) {
       fs.rmSync(uploadRoot, { recursive: true, force: true });
-      return sendJson(res, { error: error.message || "ZIP extraction failed" }, 400);
+      return sendJson(res, { error: error.message || "Archive extraction failed" }, 400);
     }
 
     const allowed = new Set(db.settings.media.allowedVideoExtensions || [".mp4", ".m4v", ".mov", ".webm"]);
@@ -899,7 +928,7 @@ async function handleApi(req, res, url) {
     walk(extractRoot);
     if (!discovered.length) {
       fs.rmSync(uploadRoot, { recursive: true, force: true });
-      return sendJson(res, { error: "No video files found in ZIP" }, 400);
+      return sendJson(res, { error: "No video files found in archive" }, 400);
     }
 
     const numbered = discovered
@@ -961,7 +990,7 @@ async function handleApi(req, res, url) {
       stats: { plays: 0, favorites: 0, comments: 0, completionRate: 0 },
       monetization: { iapEnabled: false, iaaEnabled: true, adUnlock: true, subscriptionsEnabled: String(parts.subscriptionOnly || "false") === "true" },
       upload: {
-        type: "zip",
+        type: archiveExt.slice(1),
         filename: safeName(file.filename),
         uploadedAt: new Date().toISOString(),
         matchedEpisodes: episodes.map((episode) => ({ number: episode.number, originalFilename: episode.originalFilename, videoUrl: episode.videoUrl }))

@@ -80,6 +80,7 @@ wrangler r2 object put vidshort-web/ttminis-adapter.v20260511-2.js --remote --fi
 wrangler r2 object put vidshort-web/privacy.html --remote --file public/privacy.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
 wrangler r2 object put vidshort-web/terms.html --remote --file public/terms.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
 wrangler r2 object put vidshort-web/cms.html --remote --file public/cms.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
+wrangler r2 object put vidshort-web/cms.v20260511-3.js --remote --file public/cms.v20260511-3.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 ```
 
 CMS frontend:
@@ -90,6 +91,7 @@ wrangler r2 object put vidshort-cms/styles.css --remote --file public/styles.css
 wrangler r2 object put vidshort-cms/styles.v20260511-2.css --remote --file public/styles.v20260511-2.css --content-type 'text/css; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 wrangler r2 object put vidshort-cms/cms.js --remote --file public/cms.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=300'
 wrangler r2 object put vidshort-cms/cms.v20260511-2.js --remote --file public/cms.v20260511-2.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
+wrangler r2 object put vidshort-cms/cms.v20260511-3.js --remote --file public/cms.v20260511-3.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 wrangler r2 object put vidshort-cms/icons.js --remote --file public/icons.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=300'
 wrangler r2 object put vidshort-cms/icons.v20260511-2.js --remote --file public/icons.v20260511-2.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 ```
@@ -167,5 +169,6 @@ DNS and edge certificates can take a few minutes to settle after custom domain c
 ## Operational notes
 
 - The backend still runs on the server at `101.47.12.37`.
-- The Node backend reads `/opt/vidshort/app/.env` and uploads CMS ZIP episode videos to `vidshort-cdn` when R2 S3 credentials are present.
+- The Node backend reads `/opt/vidshort/app/.env` and uploads CMS ZIP/RAR episode videos to `vidshort-cdn` when R2 S3 credentials are present.
+- RAR imports require `unar`, `7z`/`7za`, or `unrar` on the API server.
 - Use `https://cdn.vidshort.uk/<object-key>` for public video/image URLs after files are uploaded to `vidshort-cdn`.
