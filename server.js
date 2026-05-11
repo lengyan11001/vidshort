@@ -29,6 +29,14 @@ const mimeTypes = {
   ".ts": "video/mp2t"
 };
 
+function staticCacheControl(filePath) {
+  const ext = path.extname(filePath);
+  if (ext === ".html") return "no-store";
+  if ([".js", ".css"].includes(ext)) return "public, max-age=300, must-revalidate";
+  if (filePath.includes(`${path.sep}media${path.sep}`)) return "public, max-age=31536000, immutable";
+  return "public, max-age=3600";
+}
+
 const DEFAULT_SETTINGS = {
   brand: "ReelPilot",
   defaultLanguage: "English",
@@ -970,7 +978,7 @@ function serveStatic(req, res, url) {
       return;
     }
     const contentType = mimeTypes[path.extname(filePath)] || "application/octet-stream";
-    res.writeHead(200, { "Content-Type": contentType });
+    res.writeHead(200, { "Content-Type": contentType, "Cache-Control": staticCacheControl(filePath) });
     res.end(data);
   });
 }
