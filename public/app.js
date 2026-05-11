@@ -69,14 +69,14 @@ function topShell(inner) {
     <nav class="tabbar">
       <button class="tab-btn ${state.view === "home" ? "active" : ""}" data-view="home">Home</button>
       <button class="tab-btn ${state.view === "dramas" ? "active" : ""}" data-view="dramas">Dramas</button>
-      <button class="tab-btn ${state.view === "fandom" ? "active" : ""}" data-view="fandom">Fandom</button>
+      <button class="tab-btn ${state.view === "fandom" ? "active" : ""}" data-view="fandom">Guides</button>
       <button class="tab-btn ${state.view === "profile" ? "active" : ""}" data-view="profile">Me</button>
     </nav>
     ${inner}
     <nav class="bottom-nav">
       ${navItem("home", "Home", "home")}
       ${navItem("dramas", "Dramas", "list")}
-      ${navItem("fandom", "Fandom", "book")}
+      ${navItem("fandom", "Guides", "book")}
       ${navItem("profile", "Me", "user")}
     </nav>
   `;
@@ -85,6 +85,12 @@ function topShell(inner) {
 function renderHome() {
   const published = state.dramas.filter((item) => item.status === "published");
   const hero = published[0] || state.dramas[0];
+  const categories = (state.settings?.categories || [])
+    .map((category) => ({
+      category,
+      dramas: published.filter((drama) => drama.category === category)
+    }))
+    .filter((group) => group.dramas.length);
   return topShell(`
     <section class="hero">
       <div class="hero-bg" style="background-image:url('${hero.banner}')"></div>
@@ -100,12 +106,21 @@ function renderHome() {
       </div>
     </section>
     <main class="content">
-      <div class="section-head">
-        <h2 class="section-title">New Release</h2>
-      </div>
-      <div class="poster-grid">
-        ${published.map(renderPoster).join("")}
-      </div>
+      ${categories
+        .map(
+          (group) => `
+            <section class="category-section">
+              <div class="section-head">
+                <h2 class="section-title">${group.category}</h2>
+                <button class="text-link" data-category-jump="${group.category}">View all</button>
+              </div>
+              <div class="poster-rail">
+                ${group.dramas.map(renderPoster).join("")}
+              </div>
+            </section>
+          `
+        )
+        .join("") || `<p class="muted">No dramas available</p>`}
     </main>
   `);
 }
@@ -151,7 +166,7 @@ function renderFandom() {
   return topShell(`
     <main class="content">
       <div class="section-head">
-        <h1 class="section-title">Fandom</h1>
+        <h1 class="section-title">Guides</h1>
       </div>
       ${state.fandom
         .map((post) => {
@@ -347,6 +362,13 @@ function bind() {
   app.querySelectorAll("[data-category]").forEach((button) => {
     button.addEventListener("click", () => {
       state.category = button.dataset.category;
+      render();
+    });
+  });
+  app.querySelectorAll("[data-category-jump]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.category = button.dataset.categoryJump;
+      state.view = "dramas";
       render();
     });
   });
