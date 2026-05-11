@@ -409,6 +409,14 @@ function sendText(res, value, status = 200, contentType = "text/plain; charset=u
   res.end(value);
 }
 
+function sendRedirect(res, location, status = 308) {
+  res.writeHead(status, {
+    Location: location,
+    "Cache-Control": "no-store"
+  });
+  res.end();
+}
+
 function sendHtml(res, value, status = 200, headOnly = false) {
   res.writeHead(status, {
     "Content-Type": "text/html; charset=utf-8",
@@ -1176,8 +1184,8 @@ async function handleApi(req, res, url) {
 
 function serveStatic(req, res, url) {
   let pathname = decodeURIComponent(url.pathname);
+  if (pathname === "/cms") return sendRedirect(res, "https://cms.vidshort.uk/");
   if (pathname === "/") pathname = "/index.html";
-  if (pathname === "/cms") pathname = "/cms.html";
   if (!path.extname(pathname)) pathname += ".html";
 
   const baseDir = pathname.startsWith("/media/") ? ROOT : PUBLIC_DIR;

@@ -25,7 +25,7 @@ The web and CMS buckets are public through R2 custom domains. Cloudflare R2 publ
 - `https://cms.vidshort.uk/` -> `/index.html`
 - `https://vidshort.uk/privacy` -> `/privacy.html`
 - `https://vidshort.uk/terms` -> `/terms.html`
-- `https://vidshort.uk/cms` -> `/cms.html`
+- `https://vidshort.uk/cms` -> `https://cms.vidshort.uk/` redirect
 
 Reference: Cloudflare R2 public bucket/custom domain docs: https://developers.cloudflare.com/r2/buckets/public-buckets/
 
@@ -79,8 +79,7 @@ wrangler r2 object put vidshort-web/ttminis-adapter.js --remote --file public/tt
 wrangler r2 object put vidshort-web/ttminis-adapter.v20260511-4.js --remote --file public/ttminis-adapter.v20260511-4.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
 wrangler r2 object put vidshort-web/privacy.html --remote --file public/privacy.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
 wrangler r2 object put vidshort-web/terms.html --remote --file public/terms.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
-wrangler r2 object put vidshort-web/cms.html --remote --file public/cms.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
-wrangler r2 object put vidshort-web/cms.v20260511-4.js --remote --file public/cms.v20260511-4.js --content-type 'application/javascript; charset=utf-8' --cache-control 'public, max-age=31536000, immutable'
+wrangler r2 object put vidshort-web/cms.html --remote --file public/cms-redirect.html --content-type 'text/html; charset=utf-8' --cache-control 'no-cache'
 ```
 
 CMS frontend:
