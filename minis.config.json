@@ -1,0 +1,32 @@
+{
+  "appid": "replace_with_tiktok_mini_app_id",
+  "projectName": "Drama Mini Suite",
+  "clientKey": "replace_with_client_key",
+  "privacyPolicyUrl": "http://localhost:4173/privacy",
+  "termsOfServiceUrl": "http://localhost:4173/terms",
+  "dev": {
+    "command": "node server.js",
+    "port": 4173,
+    "homePage": "/"
+  },
+  "build": {
+    "outputDir": "public"
+  },
+  "window": {
+    "navigationBarTitleText": "Drama",
+    "navigationBarBackgroundColor": "#090a0d",
+    "navigationBarTextStyle": "white"
+  },
+  "domains": {
+    "request": [
+      "https://api.example.com",
+      "http://localhost:4173"
+    ],
+    "upload": [
+      "https://api.example.com"
+    ],
+    "download": [
+      "https://cdn.example.com"
+    ]
+  }
+}

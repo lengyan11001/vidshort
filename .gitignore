@@ -1,0 +1,17 @@
+node_modules/
+npm-debug.log*
+
+data/
+media/
+
+.env
+.env.*
+!.env.example
+
+*.zip
+*.tgz
+*.tar
+*.tar.gz
+
+.DS_Store
+Thumbs.db
