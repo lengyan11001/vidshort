@@ -282,6 +282,33 @@ button {
   gap: 14px;
 }
 
+.category-section {
+  margin-bottom: 28px;
+}
+
+.poster-rail {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 42%;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.poster-rail::-webkit-scrollbar {
+  display: none;
+}
+
+.text-link {
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  background: transparent;
+  font-weight: 850;
+}
+
 .poster-card {
   position: relative;
   border: 0;

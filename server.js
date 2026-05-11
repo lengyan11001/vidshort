@@ -147,6 +147,12 @@ function normalizeDb(db) {
   db.dramas.forEach((drama) => {
     drama.language = "English";
     drama.region = "US";
+    if (!Number.isFinite(Number(drama.weight))) {
+      drama.weight = 1;
+      changed = true;
+    } else {
+      drama.weight = Number(drama.weight);
+    }
     drama.monetization = {
       iapEnabled: false,
       iaaEnabled: true,
@@ -161,6 +167,19 @@ function normalizeDb(db) {
     if (drama.monetization.iaaEnabled !== true || drama.monetization.adUnlock !== true) {
       drama.monetization.iaaEnabled = true;
       drama.monetization.adUnlock = true;
+      changed = true;
+    }
+  });
+  db.fandom = db.fandom || [];
+  db.fandom.forEach((post) => {
+    if (!Number.isFinite(Number(post.weight))) {
+      post.weight = 1;
+      changed = true;
+    } else {
+      post.weight = Number(post.weight);
+    }
+    if (!post.status) {
+      post.status = "published";
       changed = true;
     }
   });
@@ -185,6 +204,7 @@ function seedData() {
       totalEpisodes: 20,
       freeEpisodes: 6,
       unlockPrice: 35,
+      weight: 8,
       subscriptionOnly: false,
       releaseDate: "2026-05-09",
       stats: { plays: 63800, favorites: 21300, comments: 1248, completionRate: 62 },
@@ -205,6 +225,7 @@ function seedData() {
       totalEpisodes: 72,
       freeEpisodes: 18,
       unlockPrice: 45,
+      weight: 10,
       subscriptionOnly: false,
       releaseDate: "2026-05-08",
       stats: { plays: 245000, favorites: 81800, comments: 4906, completionRate: 57 },
@@ -225,6 +246,7 @@ function seedData() {
       totalEpisodes: 42,
       freeEpisodes: 8,
       unlockPrice: 39,
+      weight: 1,
       subscriptionOnly: true,
       releaseDate: "2026-05-10",
       stats: { plays: 98100, favorites: 27300, comments: 1560, completionRate: 70 },
@@ -290,6 +312,8 @@ function seedData() {
       {
         id: "post_1",
         type: "Watch Guide",
+        status: "published",
+        weight: 5,
         title: "The Billionaire Don's Secret Boss: Full Guide & Streaming Options",
         dramaId: "drama_boss",
         excerpt: "A fast route through the setup, character turns, and when to start spending Beans.",
@@ -298,6 +322,8 @@ function seedData() {
       {
         id: "post_2",
         type: "Character Profiles",
+        status: "published",
+        weight: 3,
         title: "Blood Pearl of the Mer: Mira and the Tideborn Court",
         dramaId: "drama_mer",
         excerpt: "The alliances that matter before the first paid arc begins.",
@@ -397,6 +423,27 @@ function safeName(value) {
     .slice(0, 160);
 }
 
+function numberValue(value, fallback = 1) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function dramaWeight(drama) {
+  return numberValue(drama?.weight, 1);
+}
+
+function sortDramas(dramas) {
+  return [...(dramas || [])].sort((a, b) => {
+    const byWeight = dramaWeight(b) - dramaWeight(a);
+    if (byWeight) return byWeight;
+    return String(b.releaseDate || "").localeCompare(String(a.releaseDate || "")) || String(a.title || "").localeCompare(String(b.title || ""));
+  });
+}
+
+function sortFandom(posts) {
+  return [...(posts || [])].sort((a, b) => numberValue(b.weight, 1) - numberValue(a.weight, 1) || String(b.publishedAt || "").localeCompare(String(a.publishedAt || "")));
+}
+
 function episodeNumberFromName(filename, fallback) {
   const base = path.basename(filename, path.extname(filename));
   const patterns = [
@@ -432,7 +479,11 @@ function extractZip(zipPath, destDir) {
   try {
     childProcess.execFileSync("unzip", ["-q", "-o", zipPath, "-d", destDir], { stdio: "pipe" });
   } catch (error) {
-    throw new Error("ZIP extraction failed. Install unzip on the server or upload a valid ZIP file.");
+    try {
+      childProcess.execFileSync("python3", ["-m", "zipfile", "-e", zipPath, destDir], { stdio: "pipe" });
+    } catch (pythonError) {
+      throw new Error("ZIP extraction failed. Upload a valid ZIP file.");
+    }
   }
 }
 
@@ -507,11 +558,11 @@ async function handleApi(req, res, url) {
       settings: db.settings,
       user,
       metrics: publicMetrics(db),
-      dramas: db.dramas.map((drama) => ({
+      dramas: sortDramas(db.dramas).map((drama) => ({
         ...drama,
         episodeCount: db.episodes.filter((episode) => episode.dramaId === drama.id).length
       })),
-      fandom: db.fandom
+      fandom: sortFandom(db.fandom).filter((post) => post.status !== "hidden")
     });
   }
 
@@ -545,14 +596,15 @@ async function handleApi(req, res, url) {
     return sendJson(res, {
       settings: db.settings,
       metrics: publicMetrics(db),
-      dramas: db.dramas.map((drama) => ({
+      dramas: sortDramas(db.dramas).map((drama) => ({
         ...drama,
         episodeCount: db.episodes.filter((episode) => episode.dramaId === drama.id).length
       })),
       episodes: db.episodes,
       users: db.users,
       transactions: db.transactions,
-      comments: db.comments
+      comments: db.comments,
+      fandom: sortFandom(db.fandom)
     });
   }
 
@@ -584,6 +636,7 @@ async function handleApi(req, res, url) {
       totalEpisodes,
       freeEpisodes,
       unlockPrice,
+      weight: numberValue(body.weight, 1),
       subscriptionOnly: Boolean(body.subscriptionOnly),
       releaseDate: body.releaseDate || new Date().toISOString().slice(0, 10),
       stats: { plays: 0, favorites: 0, comments: 0, completionRate: 0 },
@@ -635,8 +688,14 @@ async function handleApi(req, res, url) {
     fs.mkdirSync(publicRoot, { recursive: true });
 
     const zipPath = path.join(uploadRoot, safeName(file.filename));
-    fs.writeFileSync(zipPath, file.data);
-    extractZip(zipPath, extractRoot);
+    try {
+      fs.writeFileSync(zipPath, file.data);
+      extractZip(zipPath, extractRoot);
+    } catch (error) {
+      fs.rmSync(uploadRoot, { recursive: true, force: true });
+      fs.rmSync(publicRoot, { recursive: true, force: true });
+      return sendJson(res, { error: error.message || "ZIP extraction failed" }, 400);
+    }
 
     const allowed = new Set(db.settings.media.allowedVideoExtensions || [".mp4", ".m4v", ".mov", ".webm"]);
     const discovered = [];
@@ -652,7 +711,11 @@ async function handleApi(req, res, url) {
       }
     };
     walk(extractRoot);
-    if (!discovered.length) return sendJson(res, { error: "No video files found in ZIP" }, 400);
+    if (!discovered.length) {
+      fs.rmSync(uploadRoot, { recursive: true, force: true });
+      fs.rmSync(publicRoot, { recursive: true, force: true });
+      return sendJson(res, { error: "No video files found in ZIP" }, 400);
+    }
 
     const numbered = discovered
       .map((full, index) => ({ full, number: episodeNumberFromName(path.basename(full), index + 1) }))
@@ -698,6 +761,7 @@ async function handleApi(req, res, url) {
       totalEpisodes: episodes.length,
       freeEpisodes,
       unlockPrice: 0,
+      weight: numberValue(parts.weight, 1),
       subscriptionOnly: String(parts.subscriptionOnly || "false") === "true",
       releaseDate: new Date().toISOString().slice(0, 10),
       stats: { plays: 0, favorites: 0, comments: 0, completionRate: 0 },
@@ -731,6 +795,7 @@ async function handleApi(req, res, url) {
       "description",
       "freeEpisodes",
       "unlockPrice",
+      "weight",
       "subscriptionOnly",
       "monetization"
     ];
@@ -739,6 +804,7 @@ async function handleApi(req, res, url) {
     });
     drama.freeEpisodes = Number(drama.freeEpisodes);
     drama.unlockPrice = Number(drama.unlockPrice);
+    drama.weight = numberValue(drama.weight, 1);
     db.episodes
       .filter((episode) => episode.dramaId === drama.id)
       .forEach((episode) => {
@@ -747,6 +813,44 @@ async function handleApi(req, res, url) {
       });
     writeDb(db);
     return sendJson(res, { ok: true, drama: hydrateDrama(db, drama) });
+  }
+
+  if (method === "POST" && url.pathname === "/api/fandom") {
+    const body = await readBody(req);
+    const post = {
+      id: uid("post"),
+      type: body.type || "Watch Guide",
+      status: body.status || "published",
+      weight: numberValue(body.weight, 1),
+      title: String(body.title || "Untitled Guide").trim(),
+      dramaId: body.dramaId || "",
+      image: body.image || "",
+      excerpt: body.excerpt || "",
+      publishedAt: body.publishedAt || new Date().toISOString()
+    };
+    db.fandom.unshift(post);
+    writeDb(db);
+    return sendJson(res, { ok: true, post }, 201);
+  }
+
+  if (method === "PATCH" && segments[1] === "fandom" && segments[2]) {
+    const body = await readBody(req);
+    const post = db.fandom.find((item) => item.id === segments[2]);
+    if (!post) return sendJson(res, { error: "Guide not found" }, 404);
+    ["type", "status", "title", "dramaId", "image", "excerpt", "publishedAt"].forEach((field) => {
+      if (field in body) post[field] = body[field];
+    });
+    if ("weight" in body) post.weight = numberValue(body.weight, 1);
+    writeDb(db);
+    return sendJson(res, { ok: true, post });
+  }
+
+  if (method === "DELETE" && segments[1] === "fandom" && segments[2]) {
+    const before = db.fandom.length;
+    db.fandom = db.fandom.filter((item) => item.id !== segments[2]);
+    if (db.fandom.length === before) return sendJson(res, { error: "Guide not found" }, 404);
+    writeDb(db);
+    return sendJson(res, { ok: true });
   }
 
   if (method === "POST" && url.pathname === "/api/unlock") {

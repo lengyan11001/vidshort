@@ -19,6 +19,15 @@ const lockSheet = document.querySelector("#lockSheet");
 
 const fmt = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
 
+function weightOf(item) {
+  const value = Number(item?.weight);
+  return Number.isFinite(value) ? value : 1;
+}
+
+function sortByWeight(items) {
+  return [...(items || [])].sort((a, b) => weightOf(b) - weightOf(a) || String(b.releaseDate || b.publishedAt || "").localeCompare(String(a.releaseDate || a.publishedAt || "")));
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -83,12 +92,12 @@ function topShell(inner) {
 }
 
 function renderHome() {
-  const published = state.dramas.filter((item) => item.status === "published");
+  const published = sortByWeight(state.dramas.filter((item) => item.status === "published"));
   const hero = published[0] || state.dramas[0];
   const categories = (state.settings?.categories || [])
     .map((category) => ({
       category,
-      dramas: published.filter((drama) => drama.category === category)
+      dramas: sortByWeight(published.filter((drama) => drama.category === category))
     }))
     .filter((group) => group.dramas.length);
   return topShell(`
@@ -141,11 +150,11 @@ function renderPoster(drama) {
 
 function renderDramas() {
   const categories = ["All", ...(state.settings?.categories || [])];
-  const filtered = state.dramas.filter((drama) => {
+  const filtered = sortByWeight(state.dramas.filter((drama) => {
     const matchCategory = state.category === "All" || drama.category === state.category;
     const matchSearch = !state.search || drama.title.toLowerCase().includes(state.search.toLowerCase());
     return matchCategory && matchSearch;
-  });
+  }));
   return topShell(`
     <main class="content">
       <div class="section-head">
@@ -168,7 +177,7 @@ function renderFandom() {
       <div class="section-head">
         <h1 class="section-title">Guides</h1>
       </div>
-      ${state.fandom
+      ${sortByWeight(state.fandom)
         .map((post) => {
           const drama = dramaById(post.dramaId);
           return `

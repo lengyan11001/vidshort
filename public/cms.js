@@ -6,8 +6,10 @@ const cmsState = {
   users: [],
   transactions: [],
   comments: [],
+  fandom: [],
   section: "dashboard",
   editingDramaId: null,
+  editingGuideId: null,
   dramaFilters: {
     q: "",
     status: "all",
@@ -33,6 +35,10 @@ function dramaById(id) {
   return cmsState.dramas.find((item) => item.id === id);
 }
 
+function guideById(id) {
+  return cmsState.fandom.find((item) => item.id === id);
+}
+
 function money(value) {
   return `${Number(value || 0).toLocaleString("en")} Beans`;
 }
@@ -50,6 +56,7 @@ function shell(content) {
           ${navButton("dashboard", "Dashboard", "gauge")}
           ${navButton("dramas", "Dramas", "film")}
           ${navButton("upload", "Upload", "cloudUpload")}
+          ${navButton("guides", "Guides", "book")}
           ${navButton("comments", "Comments", "messages")}
           ${navButton("users", "Users", "users")}
           ${navButton("settings", "Settings", "sliders")}
@@ -143,7 +150,7 @@ function dramas() {
         <table class="data-table compact-table">
           <thead>
             <tr>
-              <th>Drama</th><th>Status</th><th>Category</th><th>Episodes</th><th>Free</th><th>Plays</th><th>Unlock</th><th></th>
+              <th>Drama</th><th>Status</th><th>Category</th><th>Weight</th><th>Episodes</th><th>Free</th><th>Plays</th><th>Unlock</th><th></th>
             </tr>
           </thead>
           <tbody>
@@ -159,6 +166,7 @@ function dramas() {
                     </td>
                     <td><span class="cms-pill ${drama.status}">${drama.status}</span></td>
                     <td>${drama.category}</td>
+                    <td>${drama.weight ?? 1}</td>
                     <td>${drama.episodeCount || cmsState.episodes.filter((item) => item.dramaId === drama.id).length}</td>
                     <td>${drama.freeEpisodes}</td>
                     <td>${compact.format(drama.stats.plays)}</td>
@@ -169,7 +177,7 @@ function dramas() {
                   </tr>
                 `
               )
-              .join("") || `<tr><td colspan="8" class="empty-cell">No dramas</td></tr>`}
+              .join("") || `<tr><td colspan="9" class="empty-cell">No dramas</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -228,6 +236,7 @@ function editForm(drama = {}) {
         ${field("totalEpisodes", "Episodes", drama.totalEpisodes || 20, "number")}
         ${field("freeEpisodes", "Free Episodes", drama.freeEpisodes || 5, "number")}
         ${field("unlockPrice", "Unlock Price", drama.unlockPrice || 35, "number")}
+        ${field("weight", "Weight", drama.weight ?? 1, "number")}
         <div class="field"><label>Ad Unlock</label><select name="adUnlock"><option value="true" ${drama.monetization?.adUnlock !== false ? "selected" : ""}>On</option><option value="false" ${drama.monetization?.adUnlock === false ? "selected" : ""}>Off</option></select></div>
         ${field("cover", "Cover URL", drama.cover || "")}
         ${field("banner", "Banner URL", drama.banner || "")}
@@ -252,6 +261,7 @@ function upload() {
           ${field("title", "Title", "")}
           ${selectField("category", "Category", "Romance", cmsState.settings.categories)}
           ${field("freeEpisodes", "Free Episodes", cmsState.settings.monetization.freeEpisodesDefault || 6, "number")}
+          ${field("weight", "Weight", 1, "number")}
           ${field("cover", "Cover URL", "")}
           ${field("banner", "Banner URL", "")}
           <div class="field"><label>Subscription</label><select name="subscriptionOnly"><option value="false">Off</option><option value="true">On</option></select></div>
@@ -312,6 +322,87 @@ function comments() {
         </table>
       </div>
     </section>
+  `;
+}
+
+function guideForm(post = {}) {
+  const isEdit = Boolean(post.id);
+  return `
+    <form data-guide-form="${isEdit ? post.id : ""}">
+      <div class="form-grid">
+        ${field("title", "Title", post.title || "")}
+        ${selectField("status", "Status", post.status || "published", ["published", "draft", "hidden"])}
+        ${field("type", "Type", post.type || "Watch Guide")}
+        ${field("weight", "Weight", post.weight ?? 1, "number")}
+        <div class="field">
+          <label>Drama</label>
+          <select name="dramaId">
+            <option value="">None</option>
+            ${cmsState.dramas.map((drama) => `<option value="${drama.id}" ${post.dramaId === drama.id ? "selected" : ""}>${drama.title}</option>`).join("")}
+          </select>
+        </div>
+        ${field("image", "Image URL", post.image || "")}
+        <div class="field full"><label>Excerpt</label><textarea name="excerpt">${post.excerpt || ""}</textarea></div>
+      </div>
+      <div class="cms-actions">
+        ${isEdit ? `<button class="cms-btn-secondary" type="button" data-close-modal>Cancel</button>` : ""}
+        <button class="cms-btn" type="submit">${isEdit ? "Save" : "Create"}</button>
+      </div>
+    </form>
+  `;
+}
+
+function guideModal(post) {
+  if (!post) return "";
+  return `
+    <div class="cms-modal-backdrop" data-close-modal>
+      <section class="cms-modal" role="dialog" aria-modal="true" data-modal-panel>
+        <div class="cms-modal-head">
+          <div><h2>Edit Guide</h2><p>${post.title}</p></div>
+          <button class="icon-action" data-close-modal title="Close">${icon("close")}</button>
+        </div>
+        <div style="padding:0 18px 18px">${guideForm(post)}</div>
+      </section>
+    </div>
+  `;
+}
+
+function guides() {
+  const rows = [...cmsState.fandom].sort((a, b) => Number(b.weight || 1) - Number(a.weight || 1));
+  return `
+    ${pageHeader("Guides", `${rows.length} items`)}
+    <section class="cms-panel">
+      <div class="cms-panel-head"><h2>New Guide</h2></div>
+      ${guideForm()}
+    </section>
+    <section class="cms-panel">
+      <div class="table-wrap">
+        <table class="data-table compact-table">
+          <thead><tr><th>Title</th><th>Type</th><th>Status</th><th>Weight</th><th>Drama</th><th></th></tr></thead>
+          <tbody>
+            ${rows
+              .map((post) => {
+                const drama = dramaById(post.dramaId);
+                return `
+                  <tr>
+                    <td><strong>${post.title}</strong></td>
+                    <td>${post.type}</td>
+                    <td><span class="cms-pill ${post.status}">${post.status}</span></td>
+                    <td>${post.weight ?? 1}</td>
+                    <td>${drama?.title || ""}</td>
+                    <td class="row-actions">
+                      <button class="icon-action" data-edit-guide="${post.id}" title="Edit">${icon("edit")}</button>
+                      <button class="icon-action" data-delete-guide="${post.id}" title="Delete">${icon("close")}</button>
+                    </td>
+                  </tr>
+                `;
+              })
+              .join("") || `<tr><td colspan="6" class="empty-cell">No guides</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    ${cmsState.editingGuideId ? guideModal(guideById(cmsState.editingGuideId)) : ""}
   `;
 }
 
@@ -387,7 +478,7 @@ function render() {
     cmsRoot.innerHTML = `<main class="cms-main"><p>Loading</p></main>`;
     return;
   }
-  const sections = { dashboard, dramas, upload, comments, users, settings };
+  const sections = { dashboard, dramas, upload, guides, comments, users, settings };
   cmsRoot.innerHTML = shell(`<section class="cms-section active">${(sections[cmsState.section] || dashboard)()}</section>`);
   bind();
 }
@@ -405,10 +496,17 @@ function bind() {
       render();
     });
   });
+  cmsRoot.querySelectorAll("[data-edit-guide]").forEach((button) => {
+    button.addEventListener("click", () => {
+      cmsState.editingGuideId = button.dataset.editGuide;
+      render();
+    });
+  });
   cmsRoot.querySelectorAll("[data-close-modal]").forEach((element) => {
     element.addEventListener("click", (event) => {
       if (event.target.closest("[data-modal-panel]") && event.currentTarget.classList.contains("cms-modal-backdrop")) return;
       cmsState.editingDramaId = null;
+      cmsState.editingGuideId = null;
       render();
     });
   });
@@ -438,6 +536,7 @@ function bind() {
       body.totalEpisodes = Number(body.totalEpisodes);
       body.freeEpisodes = Number(body.freeEpisodes);
       body.unlockPrice = Number(body.unlockPrice);
+      body.weight = Number(body.weight || 1);
       body.subscriptionOnly = body.subscriptionOnly === "true";
       body.monetization = {
         iapEnabled: false,
@@ -454,6 +553,27 @@ function bind() {
         await api("/api/dramas", { method: "POST", body });
         cmsState.section = "dramas";
       }
+      await load();
+    });
+  });
+  cmsRoot.querySelectorAll("[data-guide-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const body = Object.fromEntries(new FormData(form).entries());
+      body.weight = Number(body.weight || 1);
+      const id = form.dataset.guideForm;
+      if (id) {
+        await api(`/api/fandom/${id}`, { method: "PATCH", body });
+        cmsState.editingGuideId = null;
+      } else {
+        await api("/api/fandom", { method: "POST", body });
+      }
+      await load();
+    });
+  });
+  cmsRoot.querySelectorAll("[data-delete-guide]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await api(`/api/fandom/${button.dataset.deleteGuide}`, { method: "DELETE" });
       await load();
     });
   });
@@ -519,6 +639,7 @@ function bind() {
       const progressText = form.querySelector("[data-upload-progress-text]");
       const submit = form.querySelector("[data-upload-submit]");
       const formData = new FormData(form);
+      formData.set("weight", String(Number(formData.get("weight") || 1)));
       if (!formData.get("file") || !formData.get("file").name) {
         result.innerHTML = `<div class="upload-message error">Choose a ZIP file</div>`;
         return;
