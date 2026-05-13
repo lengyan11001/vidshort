@@ -452,12 +452,12 @@ function cmsHtmlWithApiAssets() {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ReelPilot CMS</title>
-    <link rel="stylesheet" href="/api/assets/styles.v20260511-7.css">
+    <link rel="stylesheet" href="/api/assets/styles.v20260511-8.css">
   </head>
   <body class="cms-body">
     <div id="cms"></div>
-    <script src="/api/assets/icons.v20260511-7.js"></script>
-    <script src="/api/assets/cms.v20260511-7.js"></script>
+    <script src="/api/assets/icons.v20260511-8.js"></script>
+    <script src="/api/assets/cms.v20260511-8.js"></script>
   </body>
 </html>`;
 }
