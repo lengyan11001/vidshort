@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const childProcess = require("child_process");
+const { Pool } = require("pg");
 
 function loadDotEnv(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -30,10 +31,18 @@ const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.join(ROOT, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
+const JSON_DB_FILE = DB_FILE;
 const MEDIA_DIR = path.join(ROOT, "media");
 const CHUNK_UPLOAD_DIR = path.join(MEDIA_DIR, "chunk-uploads");
 const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
 const chunkProcessing = new Set();
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const USE_POSTGRES = Boolean(DATABASE_URL);
+const POSTGRES_COLLECTIONS = ["settings", "dramas", "episodes", "users", "transactions", "comments", "events", "fandom", "adminSessions"];
+let pgPool = null;
+let cachedDb = null;
+let persistedDb = null;
+let dbWriteChain = Promise.resolve();
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -122,22 +131,225 @@ function uid(prefix) {
   return `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
 }
 
+function getPgPool() {
+  if (!USE_POSTGRES) return null;
+  if (!pgPool) {
+    pgPool = new Pool({
+      connectionString: DATABASE_URL,
+      max: Number(process.env.PG_POOL_MAX || 20),
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000
+    });
+  }
+  return pgPool;
+}
+
 function ensureDb() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
   if (!fs.existsSync(CHUNK_UPLOAD_DIR)) fs.mkdirSync(CHUNK_UPLOAD_DIR, { recursive: true });
-  if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify(seedData(), null, 2));
+  if (!USE_POSTGRES && !fs.existsSync(JSON_DB_FILE)) fs.writeFileSync(JSON_DB_FILE, JSON.stringify(seedData(), null, 2));
+}
+
+function readJsonDb() {
+  ensureDb();
+  const db = JSON.parse(fs.readFileSync(JSON_DB_FILE, "utf8"));
+  if (normalizeDb(db)) writeJsonDb(db);
+  return db;
+}
+
+function writeJsonDb(db) {
+  fs.writeFileSync(JSON_DB_FILE, JSON.stringify(db, null, 2));
+}
+
+function cloneDb(db) {
+  return JSON.parse(JSON.stringify(db));
+}
+
+function buildEntityMap(rows = []) {
+  const map = new Map();
+  rows.forEach((item) => {
+    const id = collectionId(item, "row");
+    map.set(id, JSON.stringify(item));
+  });
+  return map;
+}
+
+function changedEntities(previousRows = [], nextRows = []) {
+  const previous = buildEntityMap(previousRows);
+  const next = buildEntityMap(nextRows);
+  const deletes = [...previous.keys()].filter((id) => !next.has(id));
+  const upserts = [];
+  for (const item of nextRows) {
+    const id = collectionId(item, "row");
+    if (previous.get(id) !== next.get(id)) upserts.push({ id, item });
+  }
+  return { deletes, upserts };
 }
 
 function readDb() {
   ensureDb();
-  const db = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
-  if (normalizeDb(db)) writeDb(db);
+  if (!cachedDb) cachedDb = readJsonDb();
+  return cachedDb;
+}
+
+async function writeDb(db) {
+  if (normalizeDb(db)) {
+    // normalizeDb mutates in place; callers expect the normalized data to be saved.
+  }
+  cachedDb = db;
+  if (!USE_POSTGRES) {
+    writeJsonDb(db);
+    return;
+  }
+  const snapshot = cloneDb(db);
+  const writePromise = dbWriteChain.then(async () => {
+    const previous = persistedDb ? cloneDb(persistedDb) : null;
+    await savePostgresDb(snapshot, previous);
+    persistedDb = cloneDb(snapshot);
+  });
+  dbWriteChain = writePromise.catch((error) => {
+    console.error("PostgreSQL write failed", error);
+  });
+  await writePromise;
+}
+
+async function ensurePostgresSchema() {
+  if (!USE_POSTGRES) return;
+  const pool = getPgPool();
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_collections (
+      name text PRIMARY KEY,
+      data jsonb NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_entities (
+      collection text NOT NULL,
+      id text NOT NULL,
+      data jsonb NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (collection, id)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_collection_updated ON app_entities (collection, updated_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_data_date ON app_entities ((data->>'date'));`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_data_drama ON app_entities ((data->>'dramaId'));`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_data_user ON app_entities ((data->>'userId'));`);
+}
+
+function collectionId(item, fallbackPrefix) {
+  if (item?.id) return String(item.id);
+  if (item?.token) return String(item.token);
+  return uid(fallbackPrefix);
+}
+
+function dbFromPostgresRows(entityRows, collectionRows) {
+  const db = seedData();
+  for (const key of POSTGRES_COLLECTIONS) {
+    db[key] = key === "settings" ? { ...DEFAULT_SETTINGS } : [];
+  }
+  for (const row of collectionRows) {
+    if (row.name === "settings") db.settings = row.data || {};
+  }
+  for (const key of POSTGRES_COLLECTIONS.filter((item) => item !== "settings")) {
+    db[key] = entityRows.filter((row) => row.collection === key).map((row) => row.data);
+  }
+  sortDbCollections(db);
   return db;
 }
 
-function writeDb(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+function sortDbCollections(db) {
+  db.dramas = sortDramas(db.dramas || []);
+  db.episodes = [...(db.episodes || [])].sort((a, b) => String(a.dramaId || "").localeCompare(String(b.dramaId || "")) || Number(a.number || 0) - Number(b.number || 0));
+  db.users = [...(db.users || [])].sort((a, b) => String(b.registeredAt || "").localeCompare(String(a.registeredAt || "")));
+  db.transactions = [...(db.transactions || [])].sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  db.comments = [...(db.comments || [])].sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  db.events = [...(db.events || [])].sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  db.fandom = sortFandom(db.fandom || []);
+  db.adminSessions = [...(db.adminSessions || [])].sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  return db;
+}
+
+async function loadPostgresDb() {
+  await ensurePostgresSchema();
+  const pool = getPgPool();
+  const [{ rows: collectionRows }, { rows: entityRows }] = await Promise.all([
+    pool.query("SELECT name, data FROM app_collections"),
+    pool.query("SELECT collection, id, data FROM app_entities ORDER BY updated_at DESC")
+  ]);
+  if (!collectionRows.length && !entityRows.length) {
+    const seed = fs.existsSync(JSON_DB_FILE) ? JSON.parse(fs.readFileSync(JSON_DB_FILE, "utf8")) : seedData();
+    normalizeDb(seed);
+    await savePostgresDb(seed);
+    persistedDb = cloneDb(seed);
+    return seed;
+  }
+  const db = dbFromPostgresRows(entityRows, collectionRows);
+  if (normalizeDb(db)) await savePostgresDb(db);
+  persistedDb = cloneDb(db);
+  return db;
+}
+
+async function savePostgresDb(db, previousDb = null) {
+  await ensurePostgresSchema();
+  const pool = getPgPool();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const settingsChanged = !previousDb || JSON.stringify(previousDb.settings || {}) !== JSON.stringify(db.settings || {});
+    if (settingsChanged) {
+      await client.query(
+        `INSERT INTO app_collections (name, data, updated_at)
+         VALUES ($1, $2::jsonb, now())
+         ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+        ["settings", JSON.stringify(db.settings || {})]
+      );
+    }
+    for (const collection of POSTGRES_COLLECTIONS.filter((item) => item !== "settings")) {
+      const rows = Array.isArray(db[collection]) ? db[collection] : [];
+      if (!previousDb) {
+        await client.query("DELETE FROM app_entities WHERE collection = $1", [collection]);
+      }
+      const diff = previousDb ? changedEntities(previousDb[collection] || [], rows) : { deletes: [], upserts: rows.map((item) => ({ id: collectionId(item, collection.slice(0, 3)), item })) };
+      for (const id of diff.deletes) {
+        await client.query("DELETE FROM app_entities WHERE collection = $1 AND id = $2", [collection, id]);
+      }
+      for (const { id, item } of diff.upserts) {
+        if (!item.id && collection !== "adminSessions") item.id = id;
+        await client.query(
+          `INSERT INTO app_entities (collection, id, data, updated_at)
+           VALUES ($1, $2, $3::jsonb, now())
+           ON CONFLICT (collection, id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+          [collection, id, JSON.stringify(item)]
+        );
+      }
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function flushDbWrites() {
+  await dbWriteChain;
+}
+
+async function initializeStorage() {
+  ensureDb();
+  if (USE_POSTGRES) {
+    cachedDb = await loadPostgresDb();
+    persistedDb = cloneDb(cachedDb);
+    console.log("PostgreSQL storage enabled");
+  } else {
+    cachedDb = readJsonDb();
+    persistedDb = cloneDb(cachedDb);
+    console.log("JSON file storage enabled");
+  }
 }
 
 function normalizeDb(db) {
@@ -1161,7 +1373,7 @@ async function completeChunkUpload(uploadId) {
       filename: meta.filename,
       uploadRoot: path.join(MEDIA_DIR, "uploads", uploadId)
     });
-    writeDb(db);
+    await writeDb(db);
     meta.status = "done";
     meta.drama = result.drama;
     meta.matched = result.matched;
@@ -1313,21 +1525,21 @@ async function handleApi(req, res, url) {
     const user = db.users.find((item) => item.id === login || item.openId === login);
     if (!user?.isAdmin) return sendJson(res, { error: "Admin access denied" }, 403);
     const session = createAdminSession(db, user);
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, token: session.token, expiresAt: session.expiresAt, user: safeUser(user) });
   }
 
   if (method === "GET" && url.pathname === "/api/cms/session") {
     const admin = getAdminUserFromReq(db, req);
     if (!admin) return sendJson(res, { error: "Admin login required" }, 401);
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, user: safeUser(admin) });
   }
 
   if (method === "POST" && url.pathname === "/api/cms/logout") {
     const token = adminTokenFromReq(req);
     db.adminSessions = (db.adminSessions || []).filter((session) => session.token !== token);
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true });
   }
 
@@ -1346,7 +1558,7 @@ async function handleApi(req, res, url) {
   if (method === "GET" && url.pathname === "/api/bootstrap") {
     const openId = url.searchParams.get("openId") || "mock_openid_demo";
     const user = getOrCreateUserByOpenId(db, openId);
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, {
       settings: db.settings,
       user,
@@ -1363,7 +1575,7 @@ async function handleApi(req, res, url) {
     const body = await readBody(req);
     const openId = body.openId || `mock_openid_${String(body.code || "local").slice(0, 12)}`;
     const user = getOrCreateUserByOpenId(db, openId);
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, {
       ok: true,
       user,
@@ -1382,14 +1594,14 @@ async function handleApi(req, res, url) {
     user.avatar = body.avatar || user.avatar;
     if (["English", "\u4e2d\u6587"].includes(body.language)) user.language = body.language;
     user.profileAuthorized = true;
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, user });
   }
 
   if (method === "GET" && url.pathname === "/api/cms") {
     const admin = requireAdmin(db, req, res);
     if (!admin) return;
-    writeDb(db);
+    await writeDb(db);
     const dashboardDate = url.searchParams.get("date") || offsetDateKey(-1);
     return sendJson(res, {
       currentAdmin: safeUser(admin),
@@ -1467,7 +1679,7 @@ async function handleApi(req, res, url) {
         plot: body.description || ""
       });
     }
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, drama: hydrateDrama(db, drama) }, 201);
   }
 
@@ -1595,7 +1807,7 @@ async function handleApi(req, res, url) {
         filename: file.filename,
         uploadRoot
       });
-      writeDb(db);
+      await writeDb(db);
       return sendJson(res, { ok: true, drama: hydrateDrama(db, result.drama), matched: result.matched }, 201);
     } catch (error) {
       fs.rmSync(uploadRoot, { recursive: true, force: true });
@@ -1636,7 +1848,7 @@ async function handleApi(req, res, url) {
         episode.isFree = episode.number <= drama.freeEpisodes;
         episode.price = episode.isFree ? 0 : drama.unlockPrice;
       });
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, drama: hydrateDrama(db, drama) });
   }
 
@@ -1649,7 +1861,7 @@ async function handleApi(req, res, url) {
     ["title", "duration", "status", "videoUrl", "plot", "resolution"].forEach((field) => {
       if (field in body) episode[field] = String(body[field] || "");
     });
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, episode });
   }
 
@@ -1669,7 +1881,7 @@ async function handleApi(req, res, url) {
       publishedAt: body.publishedAt || new Date().toISOString()
     };
     db.fandom.unshift(post);
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, post }, 201);
   }
 
@@ -1683,7 +1895,7 @@ async function handleApi(req, res, url) {
       if (field in body) post[field] = body[field];
     });
     if ("weight" in body) post.weight = numberValue(body.weight, 1);
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, post });
   }
 
@@ -1693,7 +1905,7 @@ async function handleApi(req, res, url) {
     const before = db.fandom.length;
     db.fandom = db.fandom.filter((item) => item.id !== segments[2]);
     if (db.fandom.length === before) return sendJson(res, { error: "Guide not found" }, 404);
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true });
   }
 
@@ -1718,7 +1930,7 @@ async function handleApi(req, res, url) {
       });
       logEvent(db, "unlock", { userId: user.id, dramaId: episode.dramaId, episodeId: episode.id, label: "rewarded_ad" });
     }
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, user, episode });
   }
 
@@ -1732,7 +1944,7 @@ async function handleApi(req, res, url) {
       expiresAt: body.expiresAt || new Date(Date.now() + 30 * 86400 * 1000).toISOString()
     };
     logEvent(db, "subscription", { userId: user.id, label: user.subscription.plan || "monthly" });
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, user });
   }
 
@@ -1745,7 +1957,7 @@ async function handleApi(req, res, url) {
     user.favorites = exists ? user.favorites.filter((item) => item !== drama.id) : [...user.favorites, drama.id];
     drama.stats.favorites += exists ? -1 : 1;
     logEvent(db, exists ? "unfavorite" : "favorite", { userId: user.id, dramaId: drama.id });
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, user, drama });
   }
 
@@ -1786,7 +1998,7 @@ async function handleApi(req, res, url) {
         history.updatedAt = event.createdAt;
       }
     }
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, event });
   }
 
@@ -1807,7 +2019,7 @@ async function handleApi(req, res, url) {
     const drama = db.dramas.find((item) => item.id === comment.dramaId);
     if (drama) drama.stats.comments += 1;
     logEvent(db, "comment", { userId: comment.userId, dramaId: comment.dramaId, episodeId: comment.episodeId });
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, comment }, 201);
   }
 
@@ -1818,7 +2030,7 @@ async function handleApi(req, res, url) {
     const comment = db.comments.find((item) => item.id === segments[2]);
     if (!comment) return sendJson(res, { error: "Comment not found" }, 404);
     if (body.status) comment.status = body.status;
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, comment });
   }
 
@@ -1833,7 +2045,7 @@ async function handleApi(req, res, url) {
       return sendJson(res, { error: "At least one admin is required" }, 400);
     }
     user.isAdmin = nextIsAdmin;
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, user });
   }
 
@@ -1855,7 +2067,7 @@ async function handleApi(req, res, url) {
     db.settings.launchRegion = "US";
     db.settings.regions = ["US"];
     db.settings.monetization.paymentsEnabled = false;
-    writeDb(db);
+    await writeDb(db);
     return sendJson(res, { ok: true, settings: db.settings });
   }
 
@@ -1886,8 +2098,6 @@ function serveStatic(req, res, url) {
   });
 }
 
-ensureDb();
-
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   try {
@@ -1901,7 +2111,23 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Drama Mini Suite running at http://localhost:${PORT}`);
-  console.log(`CMS running at http://localhost:${PORT}/cms`);
+initializeStorage()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`Drama Mini Suite running at http://localhost:${PORT}`);
+      console.log(`CMS running at http://localhost:${PORT}/cms`);
+    });
+  })
+  .catch((error) => {
+    console.error("Failed to initialize storage", error);
+    process.exit(1);
+  });
+
+process.on("SIGTERM", async () => {
+  try {
+    await flushDbWrites();
+    if (pgPool) await pgPool.end();
+  } finally {
+    process.exit(0);
+  }
 });
