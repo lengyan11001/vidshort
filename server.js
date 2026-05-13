@@ -79,10 +79,10 @@ function isR2Configured() {
 }
 
 const DEFAULT_SETTINGS = {
-  brand: "ReelPilot",
+  brand: "VidShort",
   defaultLanguage: "English",
   launchRegion: "US",
-  supportedLanguages: ["English", "Spanish", "Portuguese", "Indonesian", "Japanese", "Korean", "Thai", "French"],
+  supportedLanguages: ["English", "\u4e2d\u6587"],
   categories: ["Romance", "Fantasy", "Action", "Revenge", "Comedy", "Mystery"],
   regions: ["US"],
   currencyName: "Beans",
@@ -147,7 +147,11 @@ function normalizeDb(db) {
     }
   }
 
-  if (db.settings.defaultLanguage !== "English") {
+  if (db.settings.brand !== "VidShort") {
+    db.settings.brand = "VidShort";
+    changed = true;
+  }
+  if (!["English", "\u4e2d\u6587"].includes(db.settings.defaultLanguage)) {
     db.settings.defaultLanguage = "English";
     changed = true;
   }
@@ -238,7 +242,10 @@ function normalizeDb(db) {
     user.favorites = Array.isArray(user.favorites) ? user.favorites : [];
     user.unlockedEpisodes = Array.isArray(user.unlockedEpisodes) ? user.unlockedEpisodes : [];
     user.watchHistory = Array.isArray(user.watchHistory) ? user.watchHistory : [];
-    user.language = "English";
+    if (!["English", "\u4e2d\u6587"].includes(user.language)) {
+      user.language = "English";
+      changed = true;
+    }
     user.region = "US";
   });
 
@@ -369,7 +376,7 @@ function seedData() {
         resolution: number % 5 === 0 ? "720p" : "540p",
         status: "ready",
         videoUrl: "",
-        subtitleLanguages: drama.language === "English" ? ["English", "Portuguese", "Spanish"] : [drama.language],
+        subtitleLanguages: [drama.language],
         plot: number === 1 ? drama.description : `The conflict sharpens as ${drama.title} reaches turn ${number}.`
       };
     })
@@ -490,13 +497,13 @@ function cmsHtmlWithApiAssets() {
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>ReelPilot CMS</title>
-    <link rel="stylesheet" href="/api/assets/styles.v20260513-1.css">
+    <title>VidShort CMS</title>
+    <link rel="stylesheet" href="/api/assets/styles.v20260513-2.css">
   </head>
   <body class="cms-body">
     <div id="cms"></div>
-    <script src="/api/assets/icons.v20260513-1.js"></script>
-    <script src="/api/assets/cms.v20260513-1.js"></script>
+    <script src="/api/assets/icons.v20260513-2.js"></script>
+    <script src="/api/assets/cms.v20260513-2.js"></script>
   </body>
 </html>`;
 }
@@ -995,6 +1002,7 @@ async function handleApi(req, res, url) {
     if (!user) return sendJson(res, { error: "User not found" }, 404);
     user.name = body.name || user.name;
     user.avatar = body.avatar || user.avatar;
+    if (["English", "\u4e2d\u6587"].includes(body.language)) user.language = body.language;
     user.profileAuthorized = true;
     writeDb(db);
     return sendJson(res, { ok: true, user });
@@ -1402,7 +1410,9 @@ async function handleApi(req, res, url) {
       policyUrls: { ...db.settings.policyUrls, ...(body.policyUrls || {}) },
       homeCarouselIds: Array.isArray(body.homeCarouselIds) ? body.homeCarouselIds : db.settings.homeCarouselIds
     };
+    db.settings.brand = "VidShort";
     db.settings.defaultLanguage = "English";
+    db.settings.supportedLanguages = [...DEFAULT_SETTINGS.supportedLanguages];
     db.settings.launchRegion = "US";
     db.settings.regions = ["US"];
     db.settings.monetization.paymentsEnabled = false;
