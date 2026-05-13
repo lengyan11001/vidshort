@@ -554,12 +554,12 @@ function cmsHtmlWithApiAssets() {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>VidShort CMS</title>
-    <link rel="stylesheet" href="/api/assets/styles.v20260513-4.css">
+    <link rel="stylesheet" href="/api/assets/styles.v20260513-5.css">
   </head>
   <body class="cms-body">
     <div id="cms"></div>
-    <script src="/api/assets/icons.v20260513-4.js"></script>
-    <script src="/api/assets/cms.v20260513-4.js"></script>
+    <script src="/api/assets/icons.v20260513-5.js"></script>
+    <script src="/api/assets/cms.v20260513-5.js"></script>
   </body>
 </html>`;
 }
@@ -1390,6 +1390,19 @@ async function handleApi(req, res, url) {
       });
     writeDb(db);
     return sendJson(res, { ok: true, drama: hydrateDrama(db, drama) });
+  }
+
+  if (method === "PATCH" && segments[1] === "episodes" && segments[2]) {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
+    const body = await readBody(req);
+    const episode = db.episodes.find((item) => item.id === segments[2]);
+    if (!episode) return sendJson(res, { error: "Episode not found" }, 404);
+    ["title", "duration", "status", "videoUrl", "plot", "resolution"].forEach((field) => {
+      if (field in body) episode[field] = String(body[field] || "");
+    });
+    writeDb(db);
+    return sendJson(res, { ok: true, episode });
   }
 
   if (method === "POST" && url.pathname === "/api/fandom") {
