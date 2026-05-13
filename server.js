@@ -31,6 +31,9 @@ const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.join(ROOT, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const MEDIA_DIR = path.join(ROOT, "media");
+const CHUNK_UPLOAD_DIR = path.join(MEDIA_DIR, "chunk-uploads");
+const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
+const chunkProcessing = new Set();
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -122,6 +125,7 @@ function uid(prefix) {
 function ensureDb() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  if (!fs.existsSync(CHUNK_UPLOAD_DIR)) fs.mkdirSync(CHUNK_UPLOAD_DIR, { recursive: true });
   if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify(seedData(), null, 2));
 }
 
@@ -554,12 +558,12 @@ function cmsHtmlWithApiAssets() {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>VidShort CMS</title>
-    <link rel="stylesheet" href="/api/assets/styles.v20260513-5.css">
+    <link rel="stylesheet" href="/api/assets/styles.v20260513-6.css">
   </head>
   <body class="cms-body">
     <div id="cms"></div>
-    <script src="/api/assets/icons.v20260513-5.js"></script>
-    <script src="/api/assets/cms.v20260513-5.js"></script>
+    <script src="/api/assets/icons.v20260513-6.js"></script>
+    <script src="/api/assets/cms.v20260513-6.js"></script>
   </body>
 </html>`;
 }
@@ -827,6 +831,21 @@ function sha256(value, encoding = "hex") {
   return crypto.createHash("sha256").update(value).digest(encoding);
 }
 
+function fileSha256(filePath) {
+  const hash = crypto.createHash("sha256");
+  const fd = fs.openSync(filePath, "r");
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    let bytesRead = 0;
+    while ((bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest("hex");
+}
+
 function signingKey(secret, dateStamp, region) {
   const kDate = hmac(`AWS4${secret}`, dateStamp);
   const kRegion = hmac(kDate, region);
@@ -838,8 +857,8 @@ async function putR2Object(objectKey, filePath, contentType) {
   const config = runtimeR2Config();
   if (!isR2Configured()) throw new Error("R2 storage is not configured");
 
-  const body = fs.readFileSync(filePath);
-  const payloadHash = sha256(body);
+  const stat = fs.statSync(filePath);
+  const payloadHash = fileSha256(filePath);
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
   const dateStamp = amzDate.slice(0, 8);
@@ -861,12 +880,13 @@ async function putR2Object(objectKey, filePath, contentType) {
     headers: {
       Authorization: `AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
       "Content-Type": contentType,
-      "Content-Length": String(body.length),
+      "Content-Length": String(stat.size),
       "Cache-Control": "public, max-age=31536000, immutable",
       "x-amz-content-sha256": payloadHash,
       "x-amz-date": amzDate
     },
-    body
+    body: fs.createReadStream(filePath),
+    duplex: "half"
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
@@ -940,6 +960,221 @@ function extractArchive(archivePath, destDir) {
     } catch (pythonError) {
       throw new Error("ZIP extraction failed. Upload a valid ZIP file.");
     }
+  }
+}
+
+function discoverVideos(db, extractRoot) {
+  const allowed = new Set(db.settings.media.allowedVideoExtensions || [".mp4", ".m4v", ".mov", ".webm"]);
+  const discovered = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!entry.name.startsWith("__MACOSX")) walk(full);
+      } else {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (allowed.has(ext)) discovered.push(full);
+      }
+    }
+  };
+  walk(extractRoot);
+  return discovered;
+}
+
+async function importDramaArchive(db, archivePath, options = {}) {
+  const archiveExt = path.extname(archivePath).toLowerCase();
+  if (![".zip", ".rar"].includes(archiveExt)) throw new Error("Only .zip and .rar are supported");
+  const id = options.id || uid("drama");
+  const title = String(options.title || path.basename(options.filename || archivePath, archiveExt) || "Untitled Drama").trim();
+  const freeEpisodes = Number(options.freeEpisodes || db.settings.monetization.freeEpisodesDefault || 6);
+  const category = String(options.category || "Romance");
+  const uploadRoot = options.uploadRoot || path.join(MEDIA_DIR, "uploads", id);
+  const extractRoot = path.join(uploadRoot, "extract");
+  fs.rmSync(extractRoot, { recursive: true, force: true });
+  fs.mkdirSync(uploadRoot, { recursive: true });
+  extractArchive(archivePath, extractRoot);
+
+  const discovered = discoverVideos(db, extractRoot);
+  if (!discovered.length) throw new Error("No video files found in archive");
+
+  const numbered = discovered
+    .map((full, index) => ({ full, number: episodeNumberFromName(path.basename(full), index + 1) }))
+    .sort((a, b) => a.number - b.number || a.full.localeCompare(b.full));
+
+  const used = new Set();
+  const episodes = [];
+  for (const [index, item] of numbered.entries()) {
+    let number = item.number || index + 1;
+    while (used.has(number)) number += 1;
+    used.add(number);
+    const ext = path.extname(item.full).toLowerCase();
+    const filename = `episode-${String(number).padStart(3, "0")}${ext}`;
+    const stored = await storeEpisodeVideo(id, number, item.full, filename);
+    episodes.push({
+      id: `${id}_ep_${number}`,
+      dramaId: id,
+      number,
+      title: `Episode ${number}`,
+      duration: "",
+      price: number <= freeEpisodes ? 0 : 0,
+      isFree: number <= freeEpisodes,
+      resolution: "",
+      status: "ready",
+      originalFilename: path.basename(item.full),
+      videoUrl: stored.videoUrl,
+      storage: stored.storage,
+      objectKey: stored.objectKey,
+      bucket: stored.bucket,
+      subtitleLanguages: [db.settings.defaultLanguage],
+      plot: ""
+    });
+  }
+
+  const drama = {
+    id,
+    title,
+    slug: title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || id,
+    status: String(options.status || "draft"),
+    category,
+    language: db.settings.defaultLanguage,
+    region: db.settings.launchRegion,
+    tags: String(options.tags || "").split(",").map((tag) => tag.trim()).filter(Boolean),
+    cover: String(options.cover || "https://images.unsplash.com/photo-1519741497674-611481863552?auto=format&fit=crop&w=900&q=80"),
+    banner: String(options.banner || options.cover || "https://images.unsplash.com/photo-1519741497674-611481863552?auto=format&fit=crop&w=1200&q=80"),
+    description: String(options.description || ""),
+    totalEpisodes: episodes.length,
+    freeEpisodes,
+    unlockPrice: 0,
+    weight: numberValue(options.weight, 1),
+    subscriptionOnly: String(options.subscriptionOnly || "false") === "true",
+    releaseDate: new Date().toISOString().slice(0, 10),
+    stats: { plays: 0, favorites: 0, comments: 0, completionRate: 0 },
+    monetization: { iapEnabled: false, iaaEnabled: true, adUnlock: true, subscriptionsEnabled: String(options.subscriptionOnly || "false") === "true" },
+    upload: {
+      type: archiveExt.slice(1),
+      filename: safeName(options.filename || path.basename(archivePath)),
+      uploadedAt: new Date().toISOString(),
+      matchedEpisodes: episodes.map((episode) => ({ number: episode.number, originalFilename: episode.originalFilename, videoUrl: episode.videoUrl }))
+    }
+  };
+
+  db.dramas.unshift(drama);
+  db.episodes.push(...episodes);
+  return { drama, episodes, matched: drama.upload.matchedEpisodes };
+}
+
+function uploadSessionDir(uploadId) {
+  return path.join(CHUNK_UPLOAD_DIR, safeName(uploadId));
+}
+
+function uploadMetaPath(uploadId) {
+  return path.join(uploadSessionDir(uploadId), "meta.json");
+}
+
+function readUploadMeta(uploadId) {
+  const metaPath = uploadMetaPath(uploadId);
+  if (!fs.existsSync(metaPath)) return null;
+  return JSON.parse(fs.readFileSync(metaPath, "utf8"));
+}
+
+function writeUploadMeta(meta) {
+  const dir = uploadSessionDir(meta.uploadId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(uploadMetaPath(meta.uploadId), JSON.stringify(meta, null, 2));
+}
+
+function chunkPath(uploadId, index) {
+  return path.join(uploadSessionDir(uploadId), "chunks", `${String(index).padStart(6, "0")}.part`);
+}
+
+function receivedChunks(meta) {
+  const received = [];
+  for (let index = 0; index < meta.totalChunks; index += 1) {
+    if (fs.existsSync(chunkPath(meta.uploadId, index))) received.push(index);
+  }
+  return received;
+}
+
+function uploadStatus(meta) {
+  return {
+    uploadId: meta.uploadId,
+    status: meta.status || "uploading",
+    received: receivedChunks(meta),
+    totalChunks: meta.totalChunks,
+    chunkSize: meta.chunkSize,
+    fileSize: meta.fileSize,
+    error: meta.error || "",
+    drama: meta.drama || null,
+    matched: meta.matched || []
+  };
+}
+
+async function completeChunkUpload(uploadId) {
+  if (chunkProcessing.has(uploadId)) return;
+  chunkProcessing.add(uploadId);
+  try {
+    const meta = readUploadMeta(uploadId);
+    if (!meta) return;
+    meta.status = "processing";
+    meta.error = "";
+    writeUploadMeta(meta);
+
+    const dir = uploadSessionDir(uploadId);
+    const archivePath = path.join(dir, safeName(meta.filename));
+    fs.rmSync(archivePath, { force: true });
+    const output = fs.createWriteStream(archivePath);
+    for (let index = 0; index < meta.totalChunks; index += 1) {
+      const part = chunkPath(uploadId, index);
+      if (!fs.existsSync(part)) throw new Error(`Missing chunk ${index + 1}`);
+      await new Promise((resolve, reject) => {
+        const input = fs.createReadStream(part);
+        const cleanup = () => {
+          input.off("error", onError);
+          input.off("end", onEnd);
+          output.off("error", onError);
+        };
+        const onError = (error) => {
+          cleanup();
+          reject(error);
+        };
+        const onEnd = () => {
+          cleanup();
+          resolve();
+        };
+        input.once("error", onError);
+        output.once("error", onError);
+        input.once("end", onEnd);
+        input.pipe(output, { end: false });
+      });
+    }
+    await new Promise((resolve, reject) => {
+      output.once("finish", resolve);
+      output.once("error", reject);
+      output.end();
+    });
+    if (fs.statSync(archivePath).size !== Number(meta.fileSize)) throw new Error("Merged file size mismatch");
+
+    const db = readDb();
+    const result = await importDramaArchive(db, archivePath, {
+      ...meta.form,
+      id: uid("drama"),
+      filename: meta.filename,
+      uploadRoot: path.join(MEDIA_DIR, "uploads", uploadId)
+    });
+    writeDb(db);
+    meta.status = "done";
+    meta.drama = result.drama;
+    meta.matched = result.matched;
+    writeUploadMeta(meta);
+  } catch (error) {
+    const meta = readUploadMeta(uploadId);
+    if (meta) {
+      meta.status = "error";
+      meta.error = error.message || "Import failed";
+      writeUploadMeta(meta);
+    }
+  } finally {
+    chunkProcessing.delete(uploadId);
   }
 }
 
@@ -1236,6 +1471,97 @@ async function handleApi(req, res, url) {
     return sendJson(res, { ok: true, drama: hydrateDrama(db, drama) }, 201);
   }
 
+  if (method === "POST" && url.pathname === "/api/uploads/chunked/init") {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
+    const body = await readBody(req);
+    const filename = safeName(body.filename || "");
+    const fileSize = Number(body.fileSize || 0);
+    const archiveExt = path.extname(filename).toLowerCase();
+    if (!filename || ![".zip", ".rar"].includes(archiveExt)) return sendJson(res, { error: "Only .zip and .rar are supported" }, 400);
+    if (!Number.isFinite(fileSize) || fileSize <= 0) return sendJson(res, { error: "Invalid file size" }, 400);
+    const maxBytes = (db.settings.media?.maxUploadMb || 2048) * 1024 * 1024;
+    if (fileSize > maxBytes) return sendJson(res, { error: `Upload exceeds ${db.settings.media?.maxUploadMb || 2048} MB` }, 400);
+    const requestedChunkSize = Number(body.chunkSize || 32 * 1024 * 1024);
+    const chunkSize = Math.max(1024 * 1024, Math.min(MAX_CHUNK_BYTES, requestedChunkSize));
+    const totalChunks = Math.ceil(fileSize / chunkSize);
+    const fingerprint = sha256(`${filename}:${fileSize}:${body.lastModified || ""}:${body.title || ""}`);
+    const uploadId = `upl_${fingerprint.slice(0, 24)}`;
+    const existing = readUploadMeta(uploadId);
+    const form = {
+      title: body.title || path.basename(filename, archiveExt),
+      category: body.category || "Romance",
+      freeEpisodes: body.freeEpisodes || db.settings.monetization.freeEpisodesDefault || 6,
+      weight: body.weight || 1,
+      cover: body.cover || "",
+      banner: body.banner || "",
+      description: body.description || "",
+      subscriptionOnly: String(body.subscriptionOnly || "false")
+    };
+    const meta =
+      existing && existing.filename === filename && Number(existing.fileSize) === fileSize
+        ? { ...existing, form, chunkSize, totalChunks }
+        : {
+            uploadId,
+            filename,
+            fileSize,
+            chunkSize,
+            totalChunks,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            status: "uploading",
+            form
+          };
+    writeUploadMeta(meta);
+    return sendJson(res, { ok: true, ...uploadStatus(meta) });
+  }
+
+  if (method === "GET" && segments[1] === "uploads" && segments[2] === "chunked" && segments[3]) {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
+    const meta = readUploadMeta(segments[3]);
+    if (!meta) return sendJson(res, { error: "Upload not found" }, 404);
+    return sendJson(res, { ok: true, ...uploadStatus(meta) });
+  }
+
+  if (method === "PUT" && segments[1] === "uploads" && segments[2] === "chunked" && segments[3] && segments[4]) {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
+    const meta = readUploadMeta(segments[3]);
+    if (!meta) return sendJson(res, { error: "Upload not found" }, 404);
+    if (meta.status === "done") return sendJson(res, { ok: true, ...uploadStatus(meta) });
+    const index = Number(segments[4]);
+    if (!Number.isInteger(index) || index < 0 || index >= meta.totalChunks) return sendJson(res, { error: "Invalid chunk index" }, 400);
+    const expectedSize = index === meta.totalChunks - 1 ? meta.fileSize - meta.chunkSize * index : meta.chunkSize;
+    const raw = await readRawBody(req, Math.min(MAX_CHUNK_BYTES, expectedSize + 1024 * 1024));
+    if (raw.length !== expectedSize) return sendJson(res, { error: "Chunk size mismatch" }, 400);
+    const chunksDir = path.join(uploadSessionDir(meta.uploadId), "chunks");
+    fs.mkdirSync(chunksDir, { recursive: true });
+    fs.writeFileSync(chunkPath(meta.uploadId, index), raw);
+    meta.updatedAt = new Date().toISOString();
+    meta.status = "uploading";
+    writeUploadMeta(meta);
+    return sendJson(res, { ok: true, ...uploadStatus(meta) });
+  }
+
+  if (method === "POST" && segments[1] === "uploads" && segments[2] === "chunked" && segments[3] && segments[4] === "complete") {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
+    const meta = readUploadMeta(segments[3]);
+    if (!meta) return sendJson(res, { error: "Upload not found" }, 404);
+    const received = receivedChunks(meta);
+    if (received.length !== meta.totalChunks) return sendJson(res, { error: "Missing chunks", ...uploadStatus(meta) }, 400);
+    if (meta.status !== "done" && meta.status !== "processing") {
+      meta.status = "queued";
+      meta.error = "";
+      meta.updatedAt = new Date().toISOString();
+      writeUploadMeta(meta);
+      completeChunkUpload(meta.uploadId).catch(() => {});
+    }
+    const nextMeta = readUploadMeta(meta.uploadId) || meta;
+    return sendJson(res, { ok: true, ...uploadStatus(nextMeta) });
+  }
+
   if (method === "POST" && url.pathname === "/api/dramas/upload-zip") {
     const admin = requireAdmin(db, req, res);
     if (!admin) return;
@@ -1247,112 +1573,34 @@ async function handleApi(req, res, url) {
     if (![".zip", ".rar"].includes(archiveExt)) return sendJson(res, { error: "Only .zip and .rar are supported" }, 400);
 
     const id = uid("drama");
-    const title = String(parts.title || path.basename(file.filename, path.extname(file.filename)) || "Untitled Drama").trim();
-    const freeEpisodes = Number(parts.freeEpisodes || db.settings.monetization.freeEpisodesDefault || 6);
-    const category = String(parts.category || "Romance");
     const uploadRoot = path.join(MEDIA_DIR, "uploads", id);
-    const extractRoot = path.join(uploadRoot, "extract");
     fs.rmSync(uploadRoot, { recursive: true, force: true });
     fs.mkdirSync(uploadRoot, { recursive: true });
 
     const archivePath = path.join(uploadRoot, safeName(file.filename));
     try {
       fs.writeFileSync(archivePath, file.data);
-      extractArchive(archivePath, extractRoot);
+      const result = await importDramaArchive(db, archivePath, {
+        id,
+        title: parts.title,
+        status: parts.status,
+        category: parts.category,
+        tags: parts.tags,
+        freeEpisodes: parts.freeEpisodes,
+        weight: parts.weight,
+        cover: parts.cover,
+        banner: parts.banner,
+        description: parts.description,
+        subscriptionOnly: parts.subscriptionOnly,
+        filename: file.filename,
+        uploadRoot
+      });
+      writeDb(db);
+      return sendJson(res, { ok: true, drama: hydrateDrama(db, result.drama), matched: result.matched }, 201);
     } catch (error) {
       fs.rmSync(uploadRoot, { recursive: true, force: true });
-      return sendJson(res, { error: error.message || "Archive extraction failed" }, 400);
+      return sendJson(res, { error: error.message || "Archive import failed" }, 500);
     }
-
-    const allowed = new Set(db.settings.media.allowedVideoExtensions || [".mp4", ".m4v", ".mov", ".webm"]);
-    const discovered = [];
-    const walk = (dir) => {
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (!entry.name.startsWith("__MACOSX")) walk(full);
-        } else {
-          const ext = path.extname(entry.name).toLowerCase();
-          if (allowed.has(ext)) discovered.push(full);
-        }
-      }
-    };
-    walk(extractRoot);
-    if (!discovered.length) {
-      fs.rmSync(uploadRoot, { recursive: true, force: true });
-      return sendJson(res, { error: "No video files found in archive" }, 400);
-    }
-
-    const numbered = discovered
-      .map((full, index) => ({ full, number: episodeNumberFromName(path.basename(full), index + 1) }))
-      .sort((a, b) => a.number - b.number || a.full.localeCompare(b.full));
-
-    const used = new Set();
-    const episodes = [];
-    try {
-      for (const [index, item] of numbered.entries()) {
-        let number = item.number || index + 1;
-        while (used.has(number)) number += 1;
-        used.add(number);
-        const ext = path.extname(item.full).toLowerCase();
-        const filename = `episode-${String(number).padStart(3, "0")}${ext}`;
-        const stored = await storeEpisodeVideo(id, number, item.full, filename);
-        episodes.push({
-          id: `${id}_ep_${number}`,
-          dramaId: id,
-          number,
-          title: `Episode ${number}`,
-          duration: "",
-          price: number <= freeEpisodes ? 0 : 0,
-          isFree: number <= freeEpisodes,
-          resolution: "",
-          status: "ready",
-          originalFilename: path.basename(item.full),
-          videoUrl: stored.videoUrl,
-          storage: stored.storage,
-          objectKey: stored.objectKey,
-          bucket: stored.bucket,
-          subtitleLanguages: [db.settings.defaultLanguage],
-          plot: ""
-        });
-      }
-    } catch (error) {
-      fs.rmSync(uploadRoot, { recursive: true, force: true });
-      return sendJson(res, { error: error.message || "Video upload failed" }, 500);
-    }
-
-    const drama = {
-      id,
-      title,
-      slug: title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || id,
-      status: String(parts.status || "draft"),
-      category,
-      language: db.settings.defaultLanguage,
-      region: db.settings.launchRegion,
-      tags: String(parts.tags || "").split(",").map((tag) => tag.trim()).filter(Boolean),
-      cover: String(parts.cover || "https://images.unsplash.com/photo-1519741497674-611481863552?auto=format&fit=crop&w=900&q=80"),
-      banner: String(parts.banner || parts.cover || "https://images.unsplash.com/photo-1519741497674-611481863552?auto=format&fit=crop&w=1200&q=80"),
-      description: String(parts.description || ""),
-      totalEpisodes: episodes.length,
-      freeEpisodes,
-      unlockPrice: 0,
-      weight: numberValue(parts.weight, 1),
-      subscriptionOnly: String(parts.subscriptionOnly || "false") === "true",
-      releaseDate: new Date().toISOString().slice(0, 10),
-      stats: { plays: 0, favorites: 0, comments: 0, completionRate: 0 },
-      monetization: { iapEnabled: false, iaaEnabled: true, adUnlock: true, subscriptionsEnabled: String(parts.subscriptionOnly || "false") === "true" },
-      upload: {
-        type: archiveExt.slice(1),
-        filename: safeName(file.filename),
-        uploadedAt: new Date().toISOString(),
-        matchedEpisodes: episodes.map((episode) => ({ number: episode.number, originalFilename: episode.originalFilename, videoUrl: episode.videoUrl }))
-      }
-    };
-
-    db.dramas.unshift(drama);
-    db.episodes.push(...episodes);
-    writeDb(db);
-    return sendJson(res, { ok: true, drama: hydrateDrama(db, drama), matched: drama.upload.matchedEpisodes }, 201);
   }
 
   if (method === "PATCH" && segments[1] === "dramas" && segments[2]) {
