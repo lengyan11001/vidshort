@@ -220,6 +220,13 @@ function normalizeDb(db) {
 
   db.transactions = Array.isArray(db.transactions) ? db.transactions : [];
   db.comments = Array.isArray(db.comments) ? db.comments : [];
+  db.adminSessions = Array.isArray(db.adminSessions) ? db.adminSessions : [];
+  const now = Date.now();
+  const activeSessions = db.adminSessions.filter((session) => session?.token && session.userId && new Date(session.expiresAt).getTime() > now);
+  if (activeSessions.length !== db.adminSessions.length) {
+    db.adminSessions = activeSessions;
+    changed = true;
+  }
 
   db.users = db.users || [];
   db.users.forEach((user) => {
@@ -242,12 +249,24 @@ function normalizeDb(db) {
     user.favorites = Array.isArray(user.favorites) ? user.favorites : [];
     user.unlockedEpisodes = Array.isArray(user.unlockedEpisodes) ? user.unlockedEpisodes : [];
     user.watchHistory = Array.isArray(user.watchHistory) ? user.watchHistory : [];
+    if (!("isAdmin" in user)) {
+      user.isAdmin = user.id === "user_demo";
+      changed = true;
+    }
     if (!["English", "\u4e2d\u6587"].includes(user.language)) {
       user.language = "English";
       changed = true;
     }
     user.region = "US";
   });
+  if (db.users.length && !db.users.some((user) => user.isAdmin)) {
+    const bootstrapOpenId = process.env.CMS_BOOTSTRAP_ADMIN_OPENID || "";
+    const fallbackAdmin = db.users.find((user) => user.id === "user_demo" || (bootstrapOpenId && user.openId === bootstrapOpenId));
+    if (fallbackAdmin) {
+      fallbackAdmin.isAdmin = true;
+      changed = true;
+    }
+  }
 
   db.dramas = db.dramas || [];
   db.episodes = db.episodes || [];
@@ -398,6 +417,7 @@ function seedData() {
         region: "US",
         registeredAt: "2026-05-09T09:30:00Z",
         profileAuthorized: true,
+        isAdmin: true,
         subscription: { status: "inactive", expiresAt: "" },
         balance: 1280,
         favorites: ["drama_mer"],
@@ -498,12 +518,12 @@ function cmsHtmlWithApiAssets() {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>VidShort CMS</title>
-    <link rel="stylesheet" href="/api/assets/styles.v20260513-2.css">
+    <link rel="stylesheet" href="/api/assets/styles.v20260513-4.css">
   </head>
   <body class="cms-body">
     <div id="cms"></div>
-    <script src="/api/assets/icons.v20260513-2.js"></script>
-    <script src="/api/assets/cms.v20260513-2.js"></script>
+    <script src="/api/assets/icons.v20260513-4.js"></script>
+    <script src="/api/assets/cms.v20260513-4.js"></script>
   </body>
 </html>`;
 }
@@ -925,6 +945,7 @@ function getOrCreateUserByOpenId(db, openId, profile = {}) {
     balance: 0,
     registeredAt: new Date().toISOString(),
     profileAuthorized: Boolean(profile.profileAuthorized),
+    isAdmin: false,
     subscription: { status: "inactive", expiresAt: "" },
     favorites: [],
     unlockedEpisodes: [],
@@ -933,6 +954,59 @@ function getOrCreateUserByOpenId(db, openId, profile = {}) {
   db.users.push(user);
   logEvent(db, "user_register", { userId: user.id });
   return user;
+}
+
+function safeUser(user) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    openId: user.openId,
+    name: user.name,
+    avatar: user.avatar,
+    isAdmin: Boolean(user.isAdmin)
+  };
+}
+
+function adminTokenFromReq(req) {
+  const authorization = req.headers.authorization || "";
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i);
+  return bearer?.[1] || req.headers["x-admin-token"] || "";
+}
+
+function getAdminUserFromReq(db, req) {
+  const token = adminTokenFromReq(req);
+  if (!token) return null;
+  const session = (db.adminSessions || []).find((item) => item.token === token);
+  if (!session || new Date(session.expiresAt).getTime() <= Date.now()) return null;
+  const user = db.users.find((item) => item.id === session.userId);
+  if (!user?.isAdmin) return null;
+  session.lastSeenAt = new Date().toISOString();
+  return user;
+}
+
+function requireAdmin(db, req, res) {
+  const admin = getAdminUserFromReq(db, req);
+  if (!admin) {
+    sendJson(res, { error: "Admin login required" }, 401);
+    return null;
+  }
+  return admin;
+}
+
+function createAdminSession(db, user) {
+  const token = crypto.randomBytes(32).toString("base64url");
+  const createdAt = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 7 * 86400 * 1000).toISOString();
+  db.adminSessions = [
+    { token, userId: user.id, createdAt, expiresAt, lastSeenAt: createdAt },
+    ...(db.adminSessions || []).filter((session) => session.userId !== user.id)
+  ].slice(0, 100);
+  return { token, expiresAt };
+}
+
+function isLocalRequest(req) {
+  const host = String(req.headers.host || "").split(":")[0].replace(/^\[|\]$/g, "");
+  return ["localhost", "127.0.0.1", "::1"].includes(host);
 }
 
 async function handleApi(req, res, url) {
@@ -952,6 +1026,39 @@ async function handleApi(req, res, url) {
   }
 
   const db = readDb();
+
+  if (method === "POST" && url.pathname === "/api/cms/login") {
+    const body = await readBody(req);
+    const login = String(body.login || body.openId || body.userId || "").trim();
+    const requiredPassword = process.env.CMS_ADMIN_PASSWORD || "";
+    const passwordRequired = Boolean(requiredPassword) || !isLocalRequest(req);
+    if (!login) return sendJson(res, { error: "Admin account is required" }, 400);
+    if (!requiredPassword && passwordRequired) {
+      return sendJson(res, { error: "CMS admin password is not configured" }, 503);
+    }
+    if (passwordRequired && body.password !== requiredPassword) {
+      return sendJson(res, { error: "Invalid admin credentials" }, 403);
+    }
+    const user = db.users.find((item) => item.id === login || item.openId === login);
+    if (!user?.isAdmin) return sendJson(res, { error: "Admin access denied" }, 403);
+    const session = createAdminSession(db, user);
+    writeDb(db);
+    return sendJson(res, { ok: true, token: session.token, expiresAt: session.expiresAt, user: safeUser(user) });
+  }
+
+  if (method === "GET" && url.pathname === "/api/cms/session") {
+    const admin = getAdminUserFromReq(db, req);
+    if (!admin) return sendJson(res, { error: "Admin login required" }, 401);
+    writeDb(db);
+    return sendJson(res, { ok: true, user: safeUser(admin) });
+  }
+
+  if (method === "POST" && url.pathname === "/api/cms/logout") {
+    const token = adminTokenFromReq(req);
+    db.adminSessions = (db.adminSessions || []).filter((session) => session.token !== token);
+    writeDb(db);
+    return sendJson(res, { ok: true });
+  }
 
   if (method === "GET" && url.pathname === "/api/config") {
     return sendJson(res, {
@@ -1009,8 +1116,12 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "GET" && url.pathname === "/api/cms") {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
+    writeDb(db);
     const dashboardDate = url.searchParams.get("date") || offsetDateKey(-1);
     return sendJson(res, {
+      currentAdmin: safeUser(admin),
       settings: db.settings,
       metrics: publicMetrics(db),
       dashboard: dashboardForDate(db, dashboardDate),
@@ -1034,6 +1145,8 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "POST" && url.pathname === "/api/dramas") {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
     const body = await readBody(req);
     const totalEpisodes = Number(body.totalEpisodes || 20);
     const freeEpisodes = Number(body.freeEpisodes || 5);
@@ -1088,6 +1201,8 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "POST" && url.pathname === "/api/dramas/upload-zip") {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
     const raw = await readRawBody(req, (db.settings.media?.maxUploadMb || 2048) * 1024 * 1024);
     const parts = parseMultipart(req, raw);
     const file = parts.file;
@@ -1205,6 +1320,8 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "PATCH" && segments[1] === "dramas" && segments[2]) {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
     const body = await readBody(req);
     const drama = db.dramas.find((item) => item.id === segments[2]);
     if (!drama) return sendJson(res, { error: "Drama not found" }, 404);
@@ -1240,6 +1357,8 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "POST" && url.pathname === "/api/fandom") {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
     const body = await readBody(req);
     const post = {
       id: uid("post"),
@@ -1258,6 +1377,8 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "PATCH" && segments[1] === "fandom" && segments[2]) {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
     const body = await readBody(req);
     const post = db.fandom.find((item) => item.id === segments[2]);
     if (!post) return sendJson(res, { error: "Guide not found" }, 404);
@@ -1270,6 +1391,8 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "DELETE" && segments[1] === "fandom" && segments[2]) {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
     const before = db.fandom.length;
     db.fandom = db.fandom.filter((item) => item.id !== segments[2]);
     if (db.fandom.length === before) return sendJson(res, { error: "Guide not found" }, 404);
@@ -1392,6 +1515,8 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "PATCH" && segments[1] === "comments" && segments[2]) {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
     const body = await readBody(req);
     const comment = db.comments.find((item) => item.id === segments[2]);
     if (!comment) return sendJson(res, { error: "Comment not found" }, 404);
@@ -1400,7 +1525,24 @@ async function handleApi(req, res, url) {
     return sendJson(res, { ok: true, comment });
   }
 
+  if (method === "PATCH" && segments[1] === "cms" && segments[2] === "users" && segments[3] && segments[4] === "admin") {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
+    const body = await readBody(req);
+    const user = db.users.find((item) => item.id === segments[3]);
+    if (!user) return sendJson(res, { error: "User not found" }, 404);
+    const nextIsAdmin = Boolean(body.isAdmin);
+    if (!nextIsAdmin && user.isAdmin && db.users.filter((item) => item.isAdmin).length <= 1) {
+      return sendJson(res, { error: "At least one admin is required" }, 400);
+    }
+    user.isAdmin = nextIsAdmin;
+    writeDb(db);
+    return sendJson(res, { ok: true, user });
+  }
+
   if (method === "PATCH" && url.pathname === "/api/settings") {
+    const admin = requireAdmin(db, req, res);
+    if (!admin) return;
     const body = await readBody(req);
     db.settings = {
       ...db.settings,
