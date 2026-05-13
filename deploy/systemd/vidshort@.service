@@ -1,0 +1,20 @@
+[Unit]
+Description=VidShort API instance on port %i
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vidshort/app
+EnvironmentFile=-/opt/vidshort/app/.env
+Environment=PORT=%i
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

@@ -39,10 +39,24 @@ const chunkProcessing = new Set();
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const USE_POSTGRES = Boolean(DATABASE_URL);
 const POSTGRES_COLLECTIONS = ["settings", "dramas", "episodes", "users", "transactions", "comments", "events", "fandom", "adminSessions"];
+const POSTGRES_ENTITY_COLLECTIONS = POSTGRES_COLLECTIONS.filter((collection) => collection !== "events");
+const ANALYTICS_EVENT_BATCH_SIZE = Number(process.env.ANALYTICS_EVENT_BATCH_SIZE || 100);
+const ANALYTICS_EVENT_FLUSH_MS = Number(process.env.ANALYTICS_EVENT_FLUSH_MS || 1000);
+const POSTGRES_REFRESH_MS = Number(process.env.POSTGRES_REFRESH_MS || 750);
+const UPLOAD_QUEUE_POLL_MS = Number(process.env.UPLOAD_QUEUE_POLL_MS || 5000);
 let pgPool = null;
 let cachedDb = null;
 let persistedDb = null;
 let dbWriteChain = Promise.resolve();
+let postgresSchemaPromise = null;
+let analyticsEventQueue = [];
+let analyticsFlushTimer = null;
+let analyticsFlushRunning = null;
+let postgresRefreshPromise = null;
+let postgresRefreshIncludesEvents = false;
+let lastPostgresRefreshAt = 0;
+let uploadQueueTimer = null;
+let uploadQueueRunning = false;
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -189,7 +203,7 @@ function changedEntities(previousRows = [], nextRows = []) {
 
 function readDb() {
   ensureDb();
-  if (!cachedDb) cachedDb = readJsonDb();
+  if (!cachedDb) cachedDb = USE_POSTGRES ? seedData() : readJsonDb();
   return cachedDb;
 }
 
@@ -204,9 +218,11 @@ async function writeDb(db) {
   }
   const snapshot = cloneDb(db);
   const writePromise = dbWriteChain.then(async () => {
+    await flushAnalyticsEvents();
     const previous = persistedDb ? cloneDb(persistedDb) : null;
     await savePostgresDb(snapshot, previous);
     persistedDb = cloneDb(snapshot);
+    lastPostgresRefreshAt = Date.now();
   });
   dbWriteChain = writePromise.catch((error) => {
     console.error("PostgreSQL write failed", error);
@@ -216,27 +232,77 @@ async function writeDb(db) {
 
 async function ensurePostgresSchema() {
   if (!USE_POSTGRES) return;
+  if (postgresSchemaPromise) return postgresSchemaPromise;
+  postgresSchemaPromise = ensurePostgresSchemaInternal().catch((error) => {
+    postgresSchemaPromise = null;
+    throw error;
+  });
+  return postgresSchemaPromise;
+}
+
+async function ensurePostgresSchemaInternal() {
   const pool = getPgPool();
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS app_collections (
-      name text PRIMARY KEY,
-      data jsonb NOT NULL,
-      updated_at timestamptz NOT NULL DEFAULT now()
-    );
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS app_entities (
-      collection text NOT NULL,
-      id text NOT NULL,
-      data jsonb NOT NULL,
-      updated_at timestamptz NOT NULL DEFAULT now(),
-      PRIMARY KEY (collection, id)
-    );
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_collection_updated ON app_entities (collection, updated_at DESC);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_data_date ON app_entities ((data->>'date'));`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_data_drama ON app_entities ((data->>'dramaId'));`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_data_user ON app_entities ((data->>'userId'));`);
+  const client = await pool.connect();
+  try {
+    await client.query("SELECT pg_advisory_lock(hashtext('vidshort_schema_migrations'))");
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS app_collections (
+        name text PRIMARY KEY,
+        data jsonb NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS app_entities (
+        collection text NOT NULL,
+        id text NOT NULL,
+        data jsonb NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (collection, id)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_collection_updated ON app_entities (collection, updated_at DESC);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_data_date ON app_entities ((data->>'date'));`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_data_drama ON app_entities ((data->>'dramaId'));`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_app_entities_data_user ON app_entities ((data->>'userId'));`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS analytics_events (
+        id text PRIMARY KEY,
+        type text NOT NULL,
+        user_id text NOT NULL DEFAULT '',
+        drama_id text NOT NULL DEFAULT '',
+        episode_id text NOT NULL DEFAULT '',
+        label text NOT NULL DEFAULT '',
+        value numeric NOT NULL DEFAULT 1,
+        meta jsonb NOT NULL DEFAULT '{}'::jsonb,
+        date date NOT NULL,
+        created_at timestamptz NOT NULL
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_analytics_events_date_type ON analytics_events (date, type);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_analytics_events_created_at ON analytics_events (created_at DESC);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_analytics_events_user ON analytics_events (user_id, created_at DESC);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_analytics_events_drama ON analytics_events (drama_id, created_at DESC);`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS upload_jobs (
+        upload_id text PRIMARY KEY,
+        status text NOT NULL DEFAULT 'uploading',
+        meta jsonb NOT NULL,
+        error text NOT NULL DEFAULT '',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        locked_at timestamptz
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_upload_jobs_status_updated ON upload_jobs (status, updated_at);`);
+    await migrateLegacyAnalyticsEvents(client);
+  } finally {
+    try {
+      await client.query("SELECT pg_advisory_unlock(hashtext('vidshort_schema_migrations'))");
+    } finally {
+      client.release();
+    }
+  }
 }
 
 function collectionId(item, fallbackPrefix) {
@@ -245,7 +311,78 @@ function collectionId(item, fallbackPrefix) {
   return uid(fallbackPrefix);
 }
 
-function dbFromPostgresRows(entityRows, collectionRows) {
+function normalizeAnalyticsEvent(event = {}) {
+  const createdAt = event.createdAt || event.created_at || new Date().toISOString();
+  return {
+    id: String(event.id || uid("evt")),
+    type: String(event.type || "event"),
+    userId: String(event.userId || event.user_id || ""),
+    dramaId: String(event.dramaId || event.drama_id || ""),
+    episodeId: String(event.episodeId || event.episode_id || ""),
+    label: String(event.label || ""),
+    value: numberValue(event.value, 1),
+    meta: event.meta && typeof event.meta === "object" ? event.meta : {},
+    date: event.date || dateKey(createdAt),
+    createdAt
+  };
+}
+
+function analyticsEventFromRow(row) {
+  return normalizeAnalyticsEvent({
+    id: row.id,
+    type: row.type,
+    userId: row.user_id ?? row.userId,
+    dramaId: row.drama_id ?? row.dramaId,
+    episodeId: row.episode_id ?? row.episodeId,
+    label: row.label,
+    value: row.value,
+    meta: row.meta,
+    date: row.date instanceof Date ? row.date.toISOString().slice(0, 10) : row.date,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.createdAt || row.created_at
+  });
+}
+
+async function insertAnalyticsEvents(events = [], poolOverride = null) {
+  if (!USE_POSTGRES || !events.length) return;
+  const pool = poolOverride || getPgPool();
+  const normalized = events.map(normalizeAnalyticsEvent);
+  const values = [];
+  const placeholders = normalized.map((event, index) => {
+    const base = index * 10;
+    values.push(
+      event.id,
+      event.type,
+      event.userId,
+      event.dramaId,
+      event.episodeId,
+      event.label,
+      event.value,
+      JSON.stringify(event.meta || {}),
+      event.date,
+      event.createdAt
+    );
+    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}::jsonb, $${base + 9}::date, $${base + 10}::timestamptz)`;
+  });
+  await pool.query(
+    `INSERT INTO analytics_events (id, type, user_id, drama_id, episode_id, label, value, meta, date, created_at)
+     VALUES ${placeholders.join(",")}
+     ON CONFLICT (id) DO NOTHING`,
+    values
+  );
+}
+
+async function migrateLegacyAnalyticsEvents(pool) {
+  const { rows: countRows } = await pool.query("SELECT count(*)::int AS count FROM analytics_events");
+  if (Number(countRows[0]?.count || 0) > 0) return;
+  const { rows } = await pool.query("SELECT id, data FROM app_entities WHERE collection = 'events' ORDER BY updated_at ASC");
+  if (!rows.length) return;
+  const events = rows.map((row) => normalizeAnalyticsEvent({ ...(row.data || {}), id: row.data?.id || row.id }));
+  for (let index = 0; index < events.length; index += 500) {
+    await insertAnalyticsEvents(events.slice(index, index + 500), pool);
+  }
+}
+
+function dbFromPostgresRows(entityRows, collectionRows, analyticsRows = []) {
   const db = seedData();
   for (const key of POSTGRES_COLLECTIONS) {
     db[key] = key === "settings" ? { ...DEFAULT_SETTINGS } : [];
@@ -253,9 +390,10 @@ function dbFromPostgresRows(entityRows, collectionRows) {
   for (const row of collectionRows) {
     if (row.name === "settings") db.settings = row.data || {};
   }
-  for (const key of POSTGRES_COLLECTIONS.filter((item) => item !== "settings")) {
+  for (const key of POSTGRES_ENTITY_COLLECTIONS.filter((item) => item !== "settings")) {
     db[key] = entityRows.filter((row) => row.collection === key).map((row) => row.data);
   }
+  db.events = analyticsRows.map(analyticsEventFromRow);
   sortDbCollections(db);
   return db;
 }
@@ -272,21 +410,32 @@ function sortDbCollections(db) {
   return db;
 }
 
-async function loadPostgresDb() {
+async function loadPostgresDb(options = {}) {
   await ensurePostgresSchema();
   const pool = getPgPool();
-  const [{ rows: collectionRows }, { rows: entityRows }] = await Promise.all([
+  const includeEvents = options.includeEvents !== false;
+  const [{ rows: collectionRows }, { rows: entityRows }, { rows: analyticsRows }] = await Promise.all([
     pool.query("SELECT name, data FROM app_collections"),
-    pool.query("SELECT collection, id, data FROM app_entities ORDER BY updated_at DESC")
+    pool.query("SELECT collection, id, data FROM app_entities WHERE collection <> 'events' ORDER BY updated_at DESC"),
+    includeEvents
+      ? pool.query(`
+          SELECT id, type, user_id, drama_id, episode_id, label, value, meta, date::text AS date, created_at
+          FROM analytics_events
+          ORDER BY created_at DESC
+          LIMIT 50000
+        `)
+      : Promise.resolve({ rows: [] })
   ]);
-  if (!collectionRows.length && !entityRows.length) {
+  if (!collectionRows.length && !entityRows.length && !analyticsRows.length) {
     const seed = fs.existsSync(JSON_DB_FILE) ? JSON.parse(fs.readFileSync(JSON_DB_FILE, "utf8")) : seedData();
     normalizeDb(seed);
     await savePostgresDb(seed);
+    await insertAnalyticsEvents(seed.events || []);
     persistedDb = cloneDb(seed);
     return seed;
   }
-  const db = dbFromPostgresRows(entityRows, collectionRows);
+  const db = dbFromPostgresRows(entityRows, collectionRows, analyticsRows);
+  if (!includeEvents && cachedDb?.events?.length) db.events = cachedDb.events;
   if (normalizeDb(db)) await savePostgresDb(db);
   persistedDb = cloneDb(db);
   return db;
@@ -307,7 +456,10 @@ async function savePostgresDb(db, previousDb = null) {
         ["settings", JSON.stringify(db.settings || {})]
       );
     }
-    for (const collection of POSTGRES_COLLECTIONS.filter((item) => item !== "settings")) {
+    if (!previousDb && Array.isArray(db.events) && db.events.length) {
+      await insertAnalyticsEvents(db.events, pool);
+    }
+    for (const collection of POSTGRES_ENTITY_COLLECTIONS.filter((item) => item !== "settings")) {
       const rows = Array.isArray(db[collection]) ? db[collection] : [];
       if (!previousDb) {
         await client.query("DELETE FROM app_entities WHERE collection = $1", [collection]);
@@ -335,15 +487,129 @@ async function savePostgresDb(db, previousDb = null) {
   }
 }
 
+async function saveDbEntities(collection, items = []) {
+  const rows = Array.isArray(items) ? items.filter(Boolean) : [items].filter(Boolean);
+  if (!rows.length) return;
+  if (!USE_POSTGRES) {
+    if (cachedDb) writeJsonDb(cachedDb);
+    return;
+  }
+  if (!POSTGRES_ENTITY_COLLECTIONS.includes(collection) || collection === "settings") return;
+  await ensurePostgresSchema();
+  const pool = getPgPool();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const item of rows) {
+      const id = collectionId(item, collection.slice(0, 3));
+      if (!item.id && collection !== "adminSessions") item.id = id;
+      await client.query(
+        `INSERT INTO app_entities (collection, id, data, updated_at)
+         VALUES ($1, $2, $3::jsonb, now())
+         ON CONFLICT (collection, id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+        [collection, id, JSON.stringify(item)]
+      );
+    }
+    await client.query("COMMIT");
+    for (const db of [cachedDb, persistedDb].filter(Boolean)) {
+      db[collection] = Array.isArray(db[collection]) ? db[collection] : [];
+      for (const item of rows) {
+        const id = collectionId(item, collection.slice(0, 3));
+        const index = db[collection].findIndex((entry) => collectionId(entry, collection.slice(0, 3)) === id);
+        if (index >= 0) db[collection][index] = cloneDb(item);
+        else db[collection].push(cloneDb(item));
+      }
+    }
+    lastPostgresRefreshAt = Date.now();
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function scheduleAnalyticsFlush() {
+  if (!USE_POSTGRES || analyticsFlushTimer) return;
+  analyticsFlushTimer = setTimeout(() => {
+    analyticsFlushTimer = null;
+    flushAnalyticsEvents().catch((error) => console.error("Analytics event flush failed", error));
+  }, ANALYTICS_EVENT_FLUSH_MS);
+  if (typeof analyticsFlushTimer.unref === "function") analyticsFlushTimer.unref();
+}
+
+function queueAnalyticsEvent(event) {
+  if (!USE_POSTGRES) return;
+  analyticsEventQueue.push(normalizeAnalyticsEvent(event));
+  if (analyticsEventQueue.length >= ANALYTICS_EVENT_BATCH_SIZE) {
+    if (analyticsFlushTimer) {
+      clearTimeout(analyticsFlushTimer);
+      analyticsFlushTimer = null;
+    }
+    flushAnalyticsEvents().catch((error) => console.error("Analytics event flush failed", error));
+    return;
+  }
+  scheduleAnalyticsFlush();
+}
+
+async function flushAnalyticsEvents() {
+  if (!USE_POSTGRES) return;
+  if (analyticsFlushRunning) return analyticsFlushRunning;
+  if (analyticsFlushTimer) {
+    clearTimeout(analyticsFlushTimer);
+    analyticsFlushTimer = null;
+  }
+  analyticsFlushRunning = (async () => {
+    while (analyticsEventQueue.length) {
+      const batch = analyticsEventQueue.splice(0, ANALYTICS_EVENT_BATCH_SIZE);
+      try {
+        await insertAnalyticsEvents(batch);
+      } catch (error) {
+        analyticsEventQueue = [...batch, ...analyticsEventQueue];
+        throw error;
+      }
+    }
+  })().finally(() => {
+    analyticsFlushRunning = null;
+  });
+  return analyticsFlushRunning;
+}
+
 async function flushDbWrites() {
   await dbWriteChain;
+  await flushAnalyticsEvents();
+}
+
+async function refreshPostgresDb(options = {}) {
+  if (!USE_POSTGRES) return readDb();
+  if (options.flushEvents) await flushAnalyticsEvents();
+  const now = Date.now();
+  if (!options.force && cachedDb && now - lastPostgresRefreshAt < POSTGRES_REFRESH_MS) return cachedDb;
+  if (postgresRefreshPromise) {
+    if (!options.includeEvents || postgresRefreshIncludesEvents) return postgresRefreshPromise;
+    await postgresRefreshPromise;
+  }
+  postgresRefreshIncludesEvents = Boolean(options.includeEvents);
+  postgresRefreshPromise = loadPostgresDb({ includeEvents: Boolean(options.includeEvents) })
+    .then((db) => {
+      cachedDb = db;
+      persistedDb = cloneDb(db);
+      lastPostgresRefreshAt = Date.now();
+      return cachedDb;
+    })
+    .finally(() => {
+      postgresRefreshPromise = null;
+      postgresRefreshIncludesEvents = false;
+    });
+  return postgresRefreshPromise;
 }
 
 async function initializeStorage() {
   ensureDb();
   if (USE_POSTGRES) {
-    cachedDb = await loadPostgresDb();
+    cachedDb = await loadPostgresDb({ includeEvents: false });
     persistedDb = cloneDb(cachedDb);
+    lastPostgresRefreshAt = Date.now();
     console.log("PostgreSQL storage enabled");
   } else {
     cachedDb = readJsonDb();
@@ -902,6 +1168,7 @@ function logEvent(db, type, payload = {}, createdAt = new Date().toISOString()) 
   };
   db.events.unshift(event);
   if (db.events.length > 50000) db.events.length = 50000;
+  queueAnalyticsEvent(event);
   return event;
 }
 
@@ -1283,16 +1550,118 @@ function uploadMetaPath(uploadId) {
   return path.join(uploadSessionDir(uploadId), "meta.json");
 }
 
-function readUploadMeta(uploadId) {
+async function readUploadMeta(uploadId) {
+  if (USE_POSTGRES) {
+    await ensurePostgresSchema();
+    const { rows } = await getPgPool().query("SELECT meta FROM upload_jobs WHERE upload_id = $1", [uploadId]);
+    if (rows[0]?.meta) return rows[0].meta;
+  }
   const metaPath = uploadMetaPath(uploadId);
   if (!fs.existsSync(metaPath)) return null;
-  return JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  try {
+    return JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  } catch {
+    return null;
+  }
 }
 
-function writeUploadMeta(meta) {
+async function writeUploadMeta(meta) {
+  meta.updatedAt = new Date().toISOString();
   const dir = uploadSessionDir(meta.uploadId);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(uploadMetaPath(meta.uploadId), JSON.stringify(meta, null, 2));
+  if (USE_POSTGRES) {
+    await ensurePostgresSchema();
+    await getPgPool().query(
+      `INSERT INTO upload_jobs (upload_id, status, meta, error, created_at, updated_at, locked_at)
+       VALUES ($1, $2, $3::jsonb, $4, COALESCE($5::timestamptz, now()), now(), $6::timestamptz)
+       ON CONFLICT (upload_id) DO UPDATE
+       SET status = EXCLUDED.status,
+           meta = EXCLUDED.meta,
+           error = EXCLUDED.error,
+           updated_at = now(),
+           locked_at = EXCLUDED.locked_at`,
+      [
+        meta.uploadId,
+        meta.status || "uploading",
+        JSON.stringify(meta),
+        meta.error || "",
+        meta.createdAt || null,
+        meta.lockedAt || null
+      ]
+    );
+  }
+}
+
+async function claimUploadJob(uploadId) {
+  if (!USE_POSTGRES) {
+    if (chunkProcessing.has(uploadId)) return null;
+    chunkProcessing.add(uploadId);
+    const meta = await readUploadMeta(uploadId);
+    if (!meta) chunkProcessing.delete(uploadId);
+    return meta;
+  }
+  await ensurePostgresSchema();
+  const { rows } = await getPgPool().query(
+    `UPDATE upload_jobs
+     SET status = 'processing',
+         meta = jsonb_set(jsonb_set(meta, '{status}', '"processing"', true), '{lockedAt}', to_jsonb(now()::text), true),
+         locked_at = now(),
+         updated_at = now()
+     WHERE upload_id = $1
+       AND (status = 'queued' OR (status = 'processing' AND locked_at < now() - interval '15 minutes'))
+     RETURNING meta`,
+    [uploadId]
+  );
+  return rows[0]?.meta || null;
+}
+
+async function listQueuedUploadIds(limit = 2) {
+  if (!USE_POSTGRES) {
+    if (!fs.existsSync(CHUNK_UPLOAD_DIR)) return [];
+    return fs
+      .readdirSync(CHUNK_UPLOAD_DIR)
+      .filter((name) => name.startsWith("upl_"))
+      .map((uploadId) => {
+        try {
+          const meta = JSON.parse(fs.readFileSync(uploadMetaPath(uploadId), "utf8"));
+          return meta.status === "queued" ? uploadId : null;
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .slice(0, limit);
+  }
+  await ensurePostgresSchema();
+  const { rows } = await getPgPool().query(
+    `SELECT upload_id
+     FROM upload_jobs
+     WHERE status = 'queued' OR (status = 'processing' AND locked_at < now() - interval '15 minutes')
+     ORDER BY updated_at ASC
+     LIMIT $1`,
+    [limit]
+  );
+  return rows.map((row) => row.upload_id);
+}
+
+async function processQueuedUploadJobs() {
+  if (uploadQueueRunning) return;
+  uploadQueueRunning = true;
+  try {
+    const ids = await listQueuedUploadIds(2);
+    await Promise.all(ids.map((uploadId) => completeChunkUpload(uploadId)));
+  } finally {
+    uploadQueueRunning = false;
+  }
+}
+
+function startUploadQueueWorker() {
+  if (uploadQueueTimer) return;
+  uploadQueueTimer = setInterval(() => {
+    processQueuedUploadJobs().catch((error) => console.error("Upload queue worker failed", error));
+  }, UPLOAD_QUEUE_POLL_MS);
+  if (typeof uploadQueueTimer.unref === "function") uploadQueueTimer.unref();
 }
 
 function chunkPath(uploadId, index) {
@@ -1322,14 +1691,13 @@ function uploadStatus(meta) {
 }
 
 async function completeChunkUpload(uploadId) {
-  if (chunkProcessing.has(uploadId)) return;
-  chunkProcessing.add(uploadId);
+  const claimedMeta = await claimUploadJob(uploadId);
+  if (!claimedMeta) return;
   try {
-    const meta = readUploadMeta(uploadId);
-    if (!meta) return;
+    const meta = { ...claimedMeta, status: "processing", error: "", lockedAt: new Date().toISOString() };
     meta.status = "processing";
     meta.error = "";
-    writeUploadMeta(meta);
+    await writeUploadMeta(meta);
 
     const dir = uploadSessionDir(uploadId);
     const archivePath = path.join(dir, safeName(meta.filename));
@@ -1366,7 +1734,7 @@ async function completeChunkUpload(uploadId) {
     });
     if (fs.statSync(archivePath).size !== Number(meta.fileSize)) throw new Error("Merged file size mismatch");
 
-    const db = readDb();
+    const db = await refreshPostgresDb({ force: USE_POSTGRES, flushEvents: true });
     const result = await importDramaArchive(db, archivePath, {
       ...meta.form,
       id: uid("drama"),
@@ -1377,14 +1745,17 @@ async function completeChunkUpload(uploadId) {
     meta.status = "done";
     meta.drama = result.drama;
     meta.matched = result.matched;
-    writeUploadMeta(meta);
+    meta.lockedAt = "";
+    await writeUploadMeta(meta);
   } catch (error) {
-    const meta = readUploadMeta(uploadId);
+    const meta = await readUploadMeta(uploadId);
     if (meta) {
       meta.status = "error";
       meta.error = error.message || "Import failed";
-      writeUploadMeta(meta);
+      meta.lockedAt = "";
+      await writeUploadMeta(meta);
     }
+    console.error(`Upload job ${uploadId} failed`, error);
   } finally {
     chunkProcessing.delete(uploadId);
   }
@@ -1508,7 +1879,13 @@ async function handleApi(req, res, url) {
     return sendFile(res, filePath, 200, method === "HEAD");
   }
 
-  const db = readDb();
+  const db = USE_POSTGRES
+    ? await refreshPostgresDb({
+        force: url.pathname !== "/api/events",
+        flushEvents: url.pathname === "/api/cms",
+        includeEvents: url.pathname === "/api/cms"
+      })
+    : readDb();
 
   if (method === "POST" && url.pathname === "/api/cms/login") {
     const body = await readBody(req);
@@ -1699,7 +2076,7 @@ async function handleApi(req, res, url) {
     const totalChunks = Math.ceil(fileSize / chunkSize);
     const fingerprint = sha256(`${filename}:${fileSize}:${body.lastModified || ""}:${body.title || ""}`);
     const uploadId = `upl_${fingerprint.slice(0, 24)}`;
-    const existing = readUploadMeta(uploadId);
+    const existing = await readUploadMeta(uploadId);
     const form = {
       title: body.title || path.basename(filename, archiveExt),
       category: body.category || "Romance",
@@ -1724,14 +2101,14 @@ async function handleApi(req, res, url) {
             status: "uploading",
             form
           };
-    writeUploadMeta(meta);
+    await writeUploadMeta(meta);
     return sendJson(res, { ok: true, ...uploadStatus(meta) });
   }
 
   if (method === "GET" && segments[1] === "uploads" && segments[2] === "chunked" && segments[3]) {
     const admin = requireAdmin(db, req, res);
     if (!admin) return;
-    const meta = readUploadMeta(segments[3]);
+    const meta = await readUploadMeta(segments[3]);
     if (!meta) return sendJson(res, { error: "Upload not found" }, 404);
     return sendJson(res, { ok: true, ...uploadStatus(meta) });
   }
@@ -1739,7 +2116,7 @@ async function handleApi(req, res, url) {
   if (method === "PUT" && segments[1] === "uploads" && segments[2] === "chunked" && segments[3] && segments[4]) {
     const admin = requireAdmin(db, req, res);
     if (!admin) return;
-    const meta = readUploadMeta(segments[3]);
+    const meta = await readUploadMeta(segments[3]);
     if (!meta) return sendJson(res, { error: "Upload not found" }, 404);
     if (meta.status === "done") return sendJson(res, { ok: true, ...uploadStatus(meta) });
     const index = Number(segments[4]);
@@ -1752,14 +2129,14 @@ async function handleApi(req, res, url) {
     fs.writeFileSync(chunkPath(meta.uploadId, index), raw);
     meta.updatedAt = new Date().toISOString();
     meta.status = "uploading";
-    writeUploadMeta(meta);
+    await writeUploadMeta(meta);
     return sendJson(res, { ok: true, ...uploadStatus(meta) });
   }
 
   if (method === "POST" && segments[1] === "uploads" && segments[2] === "chunked" && segments[3] && segments[4] === "complete") {
     const admin = requireAdmin(db, req, res);
     if (!admin) return;
-    const meta = readUploadMeta(segments[3]);
+    const meta = await readUploadMeta(segments[3]);
     if (!meta) return sendJson(res, { error: "Upload not found" }, 404);
     const received = receivedChunks(meta);
     if (received.length !== meta.totalChunks) return sendJson(res, { error: "Missing chunks", ...uploadStatus(meta) }, 400);
@@ -1767,10 +2144,10 @@ async function handleApi(req, res, url) {
       meta.status = "queued";
       meta.error = "";
       meta.updatedAt = new Date().toISOString();
-      writeUploadMeta(meta);
-      completeChunkUpload(meta.uploadId).catch(() => {});
+      await writeUploadMeta(meta);
+      processQueuedUploadJobs().catch((error) => console.error("Upload queue trigger failed", error));
     }
-    const nextMeta = readUploadMeta(meta.uploadId) || meta;
+    const nextMeta = (await readUploadMeta(meta.uploadId)) || meta;
     return sendJson(res, { ok: true, ...uploadStatus(nextMeta) });
   }
 
@@ -1988,6 +2365,10 @@ async function handleApi(req, res, url) {
         user.watchHistory.unshift({ dramaId: episode.dramaId, episodeId: episode.id, progress: 1, updatedAt: event.createdAt });
         user.watchHistory = user.watchHistory.slice(0, 50);
       }
+      await Promise.all([
+        targetDrama ? saveDbEntities("dramas", [targetDrama]) : Promise.resolve(),
+        user ? saveDbEntities("users", [user]) : Promise.resolve()
+      ]);
     }
     if (type === "play_progress") {
       const user = db.users.find((item) => item.id === userId);
@@ -1996,9 +2377,10 @@ async function handleApi(req, res, url) {
       if (history) {
         history.progress = progress;
         history.updatedAt = event.createdAt;
+        await saveDbEntities("users", [user]);
       }
     }
-    await writeDb(db);
+    if (!USE_POSTGRES) await writeDb(db);
     return sendJson(res, { ok: true, event });
   }
 
@@ -2113,6 +2495,7 @@ const server = http.createServer(async (req, res) => {
 
 initializeStorage()
   .then(() => {
+    startUploadQueueWorker();
     server.listen(PORT, () => {
       console.log(`Drama Mini Suite running at http://localhost:${PORT}`);
       console.log(`CMS running at http://localhost:${PORT}/cms`);
@@ -2125,6 +2508,17 @@ initializeStorage()
 
 process.on("SIGTERM", async () => {
   try {
+    if (uploadQueueTimer) clearInterval(uploadQueueTimer);
+    await flushDbWrites();
+    if (pgPool) await pgPool.end();
+  } finally {
+    process.exit(0);
+  }
+});
+
+process.on("SIGINT", async () => {
+  try {
+    if (uploadQueueTimer) clearInterval(uploadQueueTimer);
     await flushDbWrites();
     if (pgPool) await pgPool.end();
   } finally {
