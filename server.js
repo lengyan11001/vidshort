@@ -229,6 +229,42 @@ function normalizeDb(db) {
   }
 
   db.users = db.users || [];
+  const defaultAdminOpenId = process.env.CMS_DEFAULT_ADMIN_OPENID || "admin";
+  const defaultAdmin = db.users.find((user) => user.id === "admin" || user.openId === defaultAdminOpenId);
+  if (defaultAdmin) {
+    if (defaultAdmin.id !== "admin") {
+      defaultAdmin.id = "admin";
+      changed = true;
+    }
+    if (defaultAdmin.openId !== defaultAdminOpenId) {
+      defaultAdmin.openId = defaultAdminOpenId;
+      changed = true;
+    }
+    if (!defaultAdmin.isAdmin) {
+      defaultAdmin.isAdmin = true;
+      changed = true;
+    }
+    defaultAdmin.name = defaultAdmin.name || "Admin";
+    defaultAdmin.avatar = defaultAdmin.avatar || "A";
+  } else {
+    db.users.unshift({
+      id: "admin",
+      openId: defaultAdminOpenId,
+      name: "Admin",
+      avatar: "A",
+      language: "English",
+      region: "US",
+      registeredAt: new Date().toISOString(),
+      profileAuthorized: true,
+      isAdmin: true,
+      subscription: { status: "inactive", expiresAt: "" },
+      balance: 0,
+      favorites: [],
+      unlockedEpisodes: [],
+      watchHistory: []
+    });
+    changed = true;
+  }
   db.users.forEach((user) => {
     if (!user.openId) {
       user.openId = user.id === "user_demo" ? "mock_openid_demo" : user.id;
