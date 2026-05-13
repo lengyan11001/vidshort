@@ -192,6 +192,31 @@ function normalizeDb(db) {
     }
   }
 
+  db.events = Array.isArray(db.events) ? db.events : [];
+  db.events.forEach((event) => {
+    if (!event.id) {
+      event.id = uid("evt");
+      changed = true;
+    }
+    if (!event.createdAt) {
+      event.createdAt = new Date().toISOString();
+      changed = true;
+    }
+    if (!event.date) {
+      event.date = dateKey(event.createdAt);
+      changed = true;
+    }
+    event.userId = event.userId || "";
+    event.dramaId = event.dramaId || "";
+    event.episodeId = event.episodeId || "";
+    event.label = event.label || "";
+    event.value = numberValue(event.value, 1);
+    event.meta = event.meta || {};
+  });
+
+  db.transactions = Array.isArray(db.transactions) ? db.transactions : [];
+  db.comments = Array.isArray(db.comments) ? db.comments : [];
+
   db.users = db.users || [];
   db.users.forEach((user) => {
     if (!user.openId) {
@@ -206,6 +231,13 @@ function normalizeDb(db) {
       user.subscription = { status: "inactive", expiresAt: "" };
       changed = true;
     }
+    if (!("registeredAt" in user)) {
+      user.registeredAt = user.createdAt || "";
+      changed = true;
+    }
+    user.favorites = Array.isArray(user.favorites) ? user.favorites : [];
+    user.unlockedEpisodes = Array.isArray(user.unlockedEpisodes) ? user.unlockedEpisodes : [];
+    user.watchHistory = Array.isArray(user.watchHistory) ? user.watchHistory : [];
     user.language = "English";
     user.region = "US";
   });
@@ -357,6 +389,7 @@ function seedData() {
         avatar: "A",
         language: "English",
         region: "US",
+        registeredAt: "2026-05-09T09:30:00Z",
         profileAuthorized: true,
         subscription: { status: "inactive", expiresAt: "" },
         balance: 1280,
@@ -372,6 +405,12 @@ function seedData() {
       { id: "txn_1001", userId: "user_demo", type: "recharge", amount: 1200, channel: "TikTok Beans", createdAt: "2026-05-09T10:00:00Z" },
       { id: "txn_1002", userId: "user_demo", type: "consume", amount: -35, channel: "Episode unlock", episodeId: "drama_mer_ep_7", createdAt: "2026-05-10T12:11:00Z" },
       { id: "txn_1003", userId: "user_demo", type: "consume", amount: -45, channel: "Episode unlock", episodeId: "drama_blade_ep_19", createdAt: "2026-05-10T21:16:00Z" }
+    ],
+    events: [
+      { id: "evt_1001", type: "user_register", userId: "user_demo", date: "2026-05-09", createdAt: "2026-05-09T09:30:00Z" },
+      { id: "evt_1002", type: "play_start", userId: "user_demo", dramaId: "drama_mer", episodeId: "drama_mer_ep_1", date: "2026-05-10", createdAt: "2026-05-10T13:10:00Z" },
+      { id: "evt_1003", type: "click", userId: "user_demo", dramaId: "drama_blade", label: "open_drama", date: "2026-05-10", createdAt: "2026-05-10T21:12:00Z" },
+      { id: "evt_1004", type: "unlock", userId: "user_demo", dramaId: "drama_blade", episodeId: "drama_blade_ep_19", date: "2026-05-10", createdAt: "2026-05-10T21:16:00Z" }
     ],
     comments: [
       { id: "cmt_1", dramaId: "drama_mer", episodeId: "drama_mer_ep_1", userId: "user_demo", userName: "Avery", body: "The opening hook is strong.", status: "visible", likes: 42, createdAt: "2026-05-10T13:20:00Z" },
@@ -452,12 +491,12 @@ function cmsHtmlWithApiAssets() {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ReelPilot CMS</title>
-    <link rel="stylesheet" href="/api/assets/styles.v20260511-8.css">
+    <link rel="stylesheet" href="/api/assets/styles.v20260513-1.css">
   </head>
   <body class="cms-body">
     <div id="cms"></div>
-    <script src="/api/assets/icons.v20260511-8.js"></script>
-    <script src="/api/assets/cms.v20260511-8.js"></script>
+    <script src="/api/assets/icons.v20260513-1.js"></script>
+    <script src="/api/assets/cms.v20260513-1.js"></script>
   </body>
 </html>`;
 }
@@ -543,6 +582,16 @@ function numberValue(value, fallback = 1) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function dateKey(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return new Date().toISOString().slice(0, 10);
+  return date.toISOString().slice(0, 10);
+}
+
+function offsetDateKey(offsetDays) {
+  return dateKey(new Date(Date.now() + offsetDays * 86400 * 1000));
+}
+
 function dramaWeight(drama) {
   return numberValue(drama?.weight, 1);
 }
@@ -557,6 +606,75 @@ function sortDramas(dramas) {
 
 function sortFandom(posts) {
   return [...(posts || [])].sort((a, b) => numberValue(b.weight, 1) - numberValue(a.weight, 1) || String(b.publishedAt || "").localeCompare(String(a.publishedAt || "")));
+}
+
+function logEvent(db, type, payload = {}, createdAt = new Date().toISOString()) {
+  const event = {
+    id: uid("evt"),
+    type,
+    userId: payload.userId || "",
+    dramaId: payload.dramaId || "",
+    episodeId: payload.episodeId || "",
+    label: payload.label || "",
+    value: numberValue(payload.value, 1),
+    meta: payload.meta || {},
+    date: dateKey(createdAt),
+    createdAt
+  };
+  db.events.unshift(event);
+  if (db.events.length > 50000) db.events.length = 50000;
+  return event;
+}
+
+function eventsForDate(db, date) {
+  const target = date || offsetDateKey(-1);
+  return (db.events || []).filter((event) => event.date === target);
+}
+
+function countEvents(events, type) {
+  return events.filter((event) => event.type === type).length;
+}
+
+function dashboardForDate(db, date) {
+  const target = date || offsetDateKey(-1);
+  const events = eventsForDate(db, target);
+  const registerUserIds = new Set([
+    ...events.filter((event) => event.type === "user_register").map((event) => event.userId).filter(Boolean),
+    ...db.users
+      .filter((user) => {
+        const registeredAt = user.registeredAt || user.createdAt;
+        return registeredAt && dateKey(registeredAt) === target;
+      })
+      .map((user) => user.id)
+  ]);
+  const playEvents = events.filter((event) => event.type === "play_start");
+  const unlockEvents = events.filter((event) => event.type === "unlock");
+  const clickEvents = events.filter((event) => event.type === "click");
+  const commentEvents = events.filter((event) => event.type === "comment");
+  const topDramas = [...playEvents.reduce((map, event) => {
+    if (!event.dramaId) return map;
+    map.set(event.dramaId, (map.get(event.dramaId) || 0) + 1);
+    return map;
+  }, new Map())]
+    .map(([dramaId, plays]) => ({ dramaId, title: db.dramas.find((drama) => drama.id === dramaId)?.title || dramaId, plays }))
+    .sort((a, b) => b.plays - a.plays)
+    .slice(0, 8);
+  const recentEvents = events.slice(0, 20);
+  return {
+    date: target,
+    metrics: {
+      registrations: registerUserIds.size,
+      clicks: clickEvents.length,
+      plays: playEvents.length,
+      unlocks: unlockEvents.length,
+      comments: commentEvents.length,
+      favorites: countEvents(events, "favorite"),
+      subscriptions: countEvents(events, "subscription"),
+      activeUsers: new Set(events.map((event) => event.userId).filter(Boolean)).size
+    },
+    topDramas,
+    recentEvents
+  };
 }
 
 function episodeNumberFromName(filename, fallback) {
@@ -798,6 +916,7 @@ function getOrCreateUserByOpenId(db, openId, profile = {}) {
     language: db.settings.defaultLanguage,
     region: db.settings.launchRegion,
     balance: 0,
+    registeredAt: new Date().toISOString(),
     profileAuthorized: Boolean(profile.profileAuthorized),
     subscription: { status: "inactive", expiresAt: "" },
     favorites: [],
@@ -805,6 +924,7 @@ function getOrCreateUserByOpenId(db, openId, profile = {}) {
     watchHistory: []
   };
   db.users.push(user);
+  logEvent(db, "user_register", { userId: user.id });
   return user;
 }
 
@@ -881,9 +1001,11 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "GET" && url.pathname === "/api/cms") {
+    const dashboardDate = url.searchParams.get("date") || offsetDateKey(-1);
     return sendJson(res, {
       settings: db.settings,
       metrics: publicMetrics(db),
+      dashboard: dashboardForDate(db, dashboardDate),
       dramas: sortDramas(db.dramas).map((drama) => ({
         ...drama,
         episodeCount: db.episodes.filter((episode) => episode.dramaId === drama.id).length
@@ -892,6 +1014,7 @@ async function handleApi(req, res, url) {
       users: db.users,
       transactions: db.transactions,
       comments: db.comments,
+      events: (db.events || []).slice(0, 500),
       fandom: sortFandom(db.fandom)
     });
   }
@@ -1165,6 +1288,7 @@ async function handleApi(req, res, url) {
         adUnitId: db.settings.monetization.rewardedAdUnitId,
         createdAt: new Date().toISOString()
       });
+      logEvent(db, "unlock", { userId: user.id, dramaId: episode.dramaId, episodeId: episode.id, label: "rewarded_ad" });
     }
     writeDb(db);
     return sendJson(res, { ok: true, user, episode });
@@ -1179,6 +1303,7 @@ async function handleApi(req, res, url) {
       plan: body.plan || "monthly",
       expiresAt: body.expiresAt || new Date(Date.now() + 30 * 86400 * 1000).toISOString()
     };
+    logEvent(db, "subscription", { userId: user.id, label: user.subscription.plan || "monthly" });
     writeDb(db);
     return sendJson(res, { ok: true, user });
   }
@@ -1191,8 +1316,50 @@ async function handleApi(req, res, url) {
     const exists = user.favorites.includes(drama.id);
     user.favorites = exists ? user.favorites.filter((item) => item !== drama.id) : [...user.favorites, drama.id];
     drama.stats.favorites += exists ? -1 : 1;
+    logEvent(db, exists ? "unfavorite" : "favorite", { userId: user.id, dramaId: drama.id });
     writeDb(db);
     return sendJson(res, { ok: true, user, drama });
+  }
+
+  if (method === "POST" && url.pathname === "/api/events") {
+    const body = await readBody(req);
+    const userId = body.userId || "user_demo";
+    const type = String(body.type || "").trim();
+    const allowed = new Set(["click", "play_start", "play_progress", "play_complete"]);
+    if (!allowed.has(type)) return sendJson(res, { error: "Unsupported event" }, 400);
+    const drama = body.dramaId ? db.dramas.find((item) => item.id === body.dramaId) : null;
+    const episode = body.episodeId ? db.episodes.find((item) => item.id === body.episodeId) : null;
+    if ((body.dramaId && !drama) || (body.episodeId && !episode)) return sendJson(res, { error: "Invalid event target" }, 400);
+    const event = logEvent(db, type, {
+      userId,
+      dramaId: body.dramaId || episode?.dramaId || "",
+      episodeId: body.episodeId || "",
+      label: body.label || "",
+      value: body.value,
+      meta: body.meta || {}
+    });
+    if (type === "play_start") {
+      const targetDrama = drama || db.dramas.find((item) => item.id === episode?.dramaId);
+      if (targetDrama) targetDrama.stats.plays = Number(targetDrama.stats.plays || 0) + 1;
+      const user = db.users.find((item) => item.id === userId);
+      if (user && episode) {
+        user.watchHistory = user.watchHistory || [];
+        user.watchHistory = user.watchHistory.filter((item) => item.episodeId !== episode.id);
+        user.watchHistory.unshift({ dramaId: episode.dramaId, episodeId: episode.id, progress: 1, updatedAt: event.createdAt });
+        user.watchHistory = user.watchHistory.slice(0, 50);
+      }
+    }
+    if (type === "play_progress") {
+      const user = db.users.find((item) => item.id === userId);
+      const progress = Math.max(0, Math.min(100, Number(body.progress || body.value || 0)));
+      const history = user?.watchHistory?.find((item) => item.episodeId === body.episodeId);
+      if (history) {
+        history.progress = progress;
+        history.updatedAt = event.createdAt;
+      }
+    }
+    writeDb(db);
+    return sendJson(res, { ok: true, event });
   }
 
   if (method === "POST" && url.pathname === "/api/comments") {
@@ -1202,7 +1369,7 @@ async function handleApi(req, res, url) {
       dramaId: body.dramaId,
       episodeId: body.episodeId,
       userId: body.userId || "user_demo",
-      userName: body.userName || "Avery",
+      userName: body.userName || db.users.find((item) => item.id === body.userId)?.name || "Avery",
       body: String(body.body || "").slice(0, 500),
       status: "visible",
       likes: 0,
@@ -1211,6 +1378,7 @@ async function handleApi(req, res, url) {
     db.comments.unshift(comment);
     const drama = db.dramas.find((item) => item.id === comment.dramaId);
     if (drama) drama.stats.comments += 1;
+    logEvent(db, "comment", { userId: comment.userId, dramaId: comment.dramaId, episodeId: comment.episodeId });
     writeDb(db);
     return sendJson(res, { ok: true, comment }, 201);
   }
